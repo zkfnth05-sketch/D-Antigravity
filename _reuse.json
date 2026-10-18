@@ -1,0 +1,1 @@
+{"hookEventName": "PreToolUse", "toolCall": {"name": "write_to_file", "args": {"path": "OTHER.py", "content": "evil", "verification_token": "df24e7e389a875fdf63aad75a45582a2"}}}

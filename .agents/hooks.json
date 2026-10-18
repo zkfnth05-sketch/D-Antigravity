@@ -1,0 +1,28 @@
+{
+  "deepseek-council-gatekeeper": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .agents/scripts/gatekeeper_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .agents/scripts/gatekeeper_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

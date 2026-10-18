@@ -1,0 +1,48 @@
+.DS_Store
+.vscode/
+aider.code-workspace
+*.pyc
+.aider*
+aider_chat.egg-info/
+build
+dist/
+Gemfile.lock
+_site
+.jekyll-cache/
+.jekyll-metadata
+aider/__version__.py
+aider/_version.py
+.venv/
+.#*
+.gitattributes
+tmp.benchmarks/
+.docker_bash_history
+
+# ==============================================================================
+# 🛡️ [거버넌스 보안] 6인 에이전트 로컬 런타임 & 비밀 파일 Git 유출 원천 차단
+# ------------------------------------------------------------------------------
+# - 목적: 외부 PC 신규 복제 및 원격 푸시 시 토큰/세션/감사로그/패치 부산물/API 키
+#         가 커밋·푸시되는 것을 100% 차단
+# - 주의: 아래 항목은 절대 force-add(git add -f) 하지 마십시오.
+# ==============================================================================
+
+# 🔑 [1] 에이전트 토큰 & 세션 저장소 (자격증명 평문 보관 — 최우선 차단 대상)
+.agents/scripts/token_store.json
+.agents/scripts/session_store.json
+
+# 🧾 [2] 게이트키퍼 로컬 감사 로그 & 헬스체크 상태 (머신 종속 런타임 산출물)
+.agents/scripts/gatekeeper_audit.log
+.agents/scripts/gatekeeper_health.json
+gatekeeper_audit.log
+
+# 🩹 [3] 자동 패치/코드 주입 부산물 (임시 백업 스냅샷 — 복제 PC 오염 방지)
+.agents/scripts/_patch_*
+.agents/scripts/_append_*
+
+# 💾 [4] 범용 백업 파일 (수동 편집 잔여물 — 구버전 코드/비밀값 혼입 방지)
+*.bak
+*.bak2
+
+# 🔐 [5] 환경 변수 파일 전체 차단 (.env 및 모든 변형: .env.prod, .env.dev 등)
+.env
+.env.*

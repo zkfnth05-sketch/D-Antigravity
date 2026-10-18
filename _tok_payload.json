@@ -1,0 +1,1 @@
+{"hookEventName": "PreToolUse", "toolCall": {"name": "write_to_file", "args": {"path": "x.py", "content": "print(1)", "verification_token": "9dc69da1ebb144e5541a53663f06120e"}}}
