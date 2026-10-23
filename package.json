@@ -1,0 +1,11 @@
+{
+  "name": "deepseek-antigravity-ide",
+  "version": "1.0.0",
+  "description": "DeepSeek-Antigravity Autonomous Multi-Agent Desktop IDE",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron electron/main.js"
+  },
+  "author": "Antigravity Triad",
+  "license": "MIT"
+}

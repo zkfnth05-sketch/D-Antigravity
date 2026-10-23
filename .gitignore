@@ -1,0 +1,79 @@
+# ============================================================
+#  DeepSeek Antigravity IDE — .gitignore
+#  목적: API 키(sk-...) 및 런타임 산출물의 원격 저장소 유출 원천 차단
+# ============================================================
+
+# ------------------------------------------------------------
+# Secrets & Credentials  (절대 커밋 금지)
+# ------------------------------------------------------------
+backend/config.json
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# ------------------------------------------------------------
+# Python & Cache
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+ENV/
+
+# ------------------------------------------------------------
+# IDE Runtime & Logs
+# ------------------------------------------------------------
+*.log
+.agents/scripts/*.log
+.agents/scripts/token_store.json
+.agents/scripts/session_store.json
+.agents/scripts/council_runtime_audit.log
+
+# ------------------------------------------------------------
+# Local Snapshots & Temp files
+# ------------------------------------------------------------
+.deepseek_snapshots/
+.deepseek_session.json
+.tmp_*
+*.tmp
+_test_*
+*.bak
+*.orig
+*.rej
+
+# ------------------------------------------------------------
+# Node / Electron
+# ------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.electron-builder-cache/
+
+# ------------------------------------------------------------
+# OS / Editor
+# ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

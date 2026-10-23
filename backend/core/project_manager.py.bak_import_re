@@ -1,0 +1,887 @@
+# -*- coding: utf-8 -*-
+"""
+ProjectManager — 프로젝트 컨텍스트 관리자 (전면 개편판)
+
+핵심 계약:
+  1) __init__(config_or_path)  : 디렉터리 경로 / config.json 파일 경로 모두 수용
+  2) resolve_path(path)        : 지능형 단일 경로 탐색 (스마트 검색)
+                                 - 절대경로 존재 → 그대로
+                                 - active_project 결합 존재 → 그대로
+                                 - basename/상대경로 일부만 전달 → active_project 하위
+                                   전체 스캔(SKIP_DIRS 제외, .agents 포함)으로 실파일 탐색
+  3) auto_bind_project_for_file(file_path) : 파일이 속한 프로젝트로 active_project 자동 전환
+  4) set_active_project(path)  : 전환 + config.json 영구 저장
+  5) list_available_projects() : Desktop 하위 유효 프로젝트 동적 스캔
+
+[Windows 경로 정규화 원칙]
+  Windows 는 드라이브 문자 대소문자(c: vs C:)와 경로 구분자(\\ vs /)를
+  대소문자 무관하게 취급하지만, 파이썬 문자열 비교는 이를 구분한다.
+  따라서 모든 경로 비교는 반드시 _norm() 을 경유해야 한다.
+  _norm(p) = os.path.normcase(os.path.abspath(p))
+    - abspath  : 상대경로 → 절대경로, '..' 및 '.' 해소
+    - normcase : Windows 에서 소문자화 + '/' → '\\' 통일 (POSIX 에서는 무변환)
+"""
+
+import os
+import json
+import logging
+from typing import Dict, List, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# 프로젝트 루트로 인정하는 표식 파일/디렉터리 (강한 표식 우선)
+STRONG_MARKERS = (
+    ".git",
+    "pyproject.toml",
+    "package.json",
+    "setup.py",
+    "requirements.txt",
+    "AGENTS.md",
+    "config.json",
+)
+
+WEAK_MARKERS = (
+    "README.md",
+    "main.py",
+    "index.js",
+)
+
+PROJECT_MARKERS = STRONG_MARKERS + WEAK_MARKERS
+
+# 파일 트리 탐색 시 제외할 디렉터리
+SKIP_DIRS = {
+    "__pycache__", ".git", ".idea", ".vscode", "node_modules", "venv", ".venv",
+    "env", "gfpgan", "chrome_profile", "reddit_profiles", "Cache", "Code Cache",
+    "dist", "build", ".pytest_cache", ".mypy_cache", "site-packages",
+}
+
+CONFIG_FILENAME = "config.json"
+
+# 스마트 검색(Smart Search) 정책
+#   - SKIP_DIRS 는 제외하되, '.agents' 처럼 점(.)으로 시작하는 업무용 디렉터리는
+#     반드시 탐색 대상에 포함한다. (요구사항: ".agents 포함")
+SMART_SEARCH_MAX_DEPTH = 12          # 무한 재귀 방지용 최대 깊이
+SMART_SEARCH_MAX_VISITS = 200000     # 대형 트리 폭주 방지용 방문 노드 상한
+SMART_SEARCH_INCLUDE_DOT_DIRS = True  # 점(.) 시작 디렉터리 포함 여부
+
+
+# ======================================================================
+# 경로 정규화 헬퍼 (모듈 레벨 — 어디서든 재사용)
+# ======================================================================
+def _norm(path: Any) -> str:
+    """
+    경로 비교용 정규화 문자열을 반환한다.
+
+    Windows 드라이브 문자 대소문자(c: vs C:) 및 경로 구분자(\\ vs /) 불일치로
+    인한 비교 실패를 원천 차단한다.
+
+    - None / 빈 문자열 → ""
+    - 그 외 → os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+    """
+    if path is None:
+        return ""
+    raw = str(path).strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.expanduser(raw)))
+    except Exception:
+        # 비정상 경로(널 문자 등) 방어 — 비교 실패로 인한 예외 전파 차단
+        return os.path.normcase(raw)
+
+
+class ProjectManager:
+    """프로젝트 컨텍스트(활성 프로젝트) 관리자."""
+
+    # ------------------------------------------------------------------
+    # 1. 초기화 — 디렉터리 경로 / config.json 파일 경로 모두 수용
+    # ------------------------------------------------------------------
+    def __init__(self, config_or_path: str):
+        self.desktop_path = self._detect_desktop_path()
+
+        self.config_path: str = ""
+        self.config: Dict[str, Any] = {}
+        self.active_project: str = ""
+
+        raw = (config_or_path or "").strip().strip('"').strip("'")
+        if not raw:
+            raw = self.desktop_path
+
+        raw_abs = os.path.abspath(os.path.expanduser(raw))
+
+        if os.path.isdir(raw_abs):
+            # (A) 디렉터리 경로로 초기화
+            self.active_project = raw_abs
+            self.config_path = self._discover_config_path(raw_abs)
+            self.config = self._load_config()
+            # config.json 에 저장된 active_project 가 유효하면 그것을 우선 채택
+            saved = self.config.get("active_project")
+            if saved and os.path.isdir(saved):
+                self.active_project = os.path.abspath(saved)
+            logger.info("[ProjectManager] 디렉터리 초기화: active_project=%s", self.active_project)
+        else:
+            # (B) 파일 경로(config.json)로 초기화
+            self.config_path = raw_abs
+            self.config = self._load_config()
+            saved = self.config.get("active_project")
+            if saved and os.path.isdir(saved):
+                self.active_project = os.path.abspath(saved)
+            else:
+                # config.json 이 있는 폴더를 프로젝트 루트로 간주
+                parent = os.path.dirname(raw_abs)
+                self.active_project = parent if os.path.isdir(parent) else self.desktop_path
+            logger.info("[ProjectManager] 파일 초기화: config=%s, active_project=%s",
+                        self.config_path, self.active_project)
+
+        # 최종 방어: active_project 가 비었거나 존재하지 않으면 Desktop 으로 폴백
+        if not self.active_project or not os.path.isdir(self.active_project):
+            self.active_project = self.desktop_path
+
+        self.active_project = os.path.abspath(self.active_project)
+
+    # ------------------------------------------------------------------
+    # 내부 유틸
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _detect_desktop_path() -> str:
+        """사용자 Desktop 경로를 견고하게 탐지."""
+        candidates = [
+            os.path.join(os.path.expanduser("~"), "Desktop"),
+            os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop"),
+            os.path.join(os.path.expanduser("~"), "바탕 화면"),
+            os.path.join(os.path.expanduser("~"), "OneDrive", "바탕 화면"),
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                return os.path.abspath(c)
+        return os.path.abspath(os.path.expanduser("~"))
+
+    def _discover_config_path(self, start_dir: str) -> str:
+        """
+        start_dir 및 상위 폴더를 순회하며 config.json 을 탐색.
+        발견 시 해당 경로, 미발견 시 start_dir/config.json 을 기본값으로 반환.
+        """
+        current = os.path.abspath(start_dir)
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+            candidate = os.path.join(current, CONFIG_FILENAME)
+            if os.path.isfile(candidate):
+                return candidate
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        return os.path.join(os.path.abspath(start_dir), CONFIG_FILENAME)
+
+    def _load_config(self) -> Dict[str, Any]:
+        """config.json 로드 (실패 시 빈 dict)."""
+        if self.config_path and os.path.isfile(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                logger.warning("[ProjectManager] config 로드 실패: %s", e)
+        return {}
+
+    def save_config(self, new_cfg: Dict[str, Any]) -> bool:
+        """config.json 병합 저장."""
+        self.config.update(new_cfg or {})
+        if not self.config_path:
+            logger.warning("[ProjectManager] config_path 미설정 — 저장 생략")
+            return False
+        try:
+            parent = os.path.dirname(self.config_path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logger.error("[ProjectManager] config 저장 실패: %s", e)
+            return False
+
+    # ------------------------------------------------------------------
+    # 2. 경로 해석 — 지능형 단일 경로 탐색 (Smart Search)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_skippable_dir(name: str) -> bool:
+        """
+        스마트 검색에서 건너뛸 디렉터리인지 판정.
+
+        - SKIP_DIRS 에 포함되면 제외 (__pycache__, node_modules, .git 등)
+        - 점(.)으로 시작하는 디렉터리는 '.agents' 처럼 업무 자산일 수 있으므로
+          SMART_SEARCH_INCLUDE_DOT_DIRS 가 True 이면 탐색 대상에 포함한다.
+        """
+        if not name:
+            return True
+        if name in SKIP_DIRS:
+            return True
+        if name.startswith(".") and not SMART_SEARCH_INCLUDE_DOT_DIRS:
+            return True
+        return False
+
+    def _smart_search_file(self, root: str, target_name: str) -> Optional[str]:
+        """
+        root 하위 디렉터리를 전수 스캔하여 target_name(소문자 비교)과
+        일치하는 실제 파일의 절대경로를 반환한다.
+
+        - SKIP_DIRS 제외, '.agents' 등 점(.) 시작 업무 디렉터리는 포함
+        - 깊이 우선(BFS) 탐색으로 얕은 경로의 파일을 우선 발견
+        - 깊이 상한 / 방문 노드 상한으로 폭주 방지
+        - 심볼릭 링크 순환 방어(방문 디렉터리 정규화 집합)
+        """
+        if not root or not os.path.isdir(root) or not target_name:
+            return None
+
+        target_lower = target_name.lower()
+        root_abs = os.path.abspath(root)
+
+        # BFS 큐: (디렉터리 절대경로, 깊이)
+        queue: List[Any] = [(root_abs, 0)]
+        visited_dirs = set()
+        visits = 0
+
+        while queue:
+            current, depth = queue.pop(0)
+
+            cur_norm = _norm(current)
+            if cur_norm in visited_dirs:
+                continue
+            visited_dirs.add(cur_norm)
+
+            if depth > SMART_SEARCH_MAX_DEPTH:
+                continue
+
+            try:
+                entries = list(os.scandir(current))
+            except Exception:
+                continue
+
+            # 같은 디렉터리 내에서는 파일을 먼저 확인 (정확 일치 우선)
+            sub_dirs: List[str] = []
+            for entry in entries:
+                visits += 1
+                if visits > SMART_SEARCH_MAX_VISITS:
+                    logger.warning(
+                        "[ProjectManager] 스마트 검색 상한 도달(%s) — 탐색 중단: %s",
+                        SMART_SEARCH_MAX_VISITS, root_abs,
+                    )
+                    return None
+                try:
+                    if entry.is_file(follow_symlinks=False) or entry.is_file():
+                        if entry.name.lower() == target_lower:
+                            found = os.path.abspath(entry.path)
+                            logger.info(
+                                "[ProjectManager] 스마트 검색 성공: '%s' → %s",
+                                target_name, found,
+                            )
+                            return found
+                    elif entry.is_dir(follow_symlinks=False) or entry.is_dir():
+                        if self._is_skippable_dir(entry.name):
+                            continue
+                        sub_dirs.append(entry.path)
+                except Exception:
+                    continue
+
+            # 정렬하여 결정적(deterministic) 탐색 순서 보장
+            for d in sorted(sub_dirs, key=lambda p: os.path.basename(p).lower()):
+                queue.append((d, depth + 1))
+
+        return None
+
+    def resolve_path(self, path: str) -> str:
+        """
+        지능형 단일 경로 탐색 (Smart Resolve).
+
+        해석 순서:
+          (1) 빈 경로            → active_project 절대경로 반환
+          (2) 절대 경로 + 존재   → 해당 경로 그대로 반환
+          (3) active_project 결합 경로가 실제 존재 → 그 경로 반환
+          (4) 파일명(basename)만 전달되었거나 상대경로 일부가 전달된 경우
+              → active_project 하위 전체 스캔(SKIP_DIRS 제외, .agents 포함)으로
+                target_name.lower() 와 일치하는 실파일의 절대경로 반환
+                예) "council_runtime.py" → <active>/.agents/scripts/council_runtime.py
+          (5) 그래도 없으면 active_project 기준 결합 경로 반환 (신규 파일 생성 대비)
+
+        절대 경로가 존재하지 않는 경우에도 (4) 스마트 검색을 수행하여
+        다른 위치의 동명 파일을 찾아준다. (예: 드라이브 문자만 다른 경우)
+        """
+        # (1) 빈 경로 → 활성 프로젝트 루트
+        if not path or not str(path).strip():
+            return os.path.abspath(self.active_project)
+
+        raw = str(path).strip().strip('"').strip("'")
+        raw = os.path.expanduser(raw)
+        if not raw:
+            return os.path.abspath(self.active_project)
+
+        base = self.active_project or self.desktop_path
+
+        # (2) 절대 경로이며 실제 존재 → 그대로 반환
+        if os.path.isabs(raw):
+            abs_candidate = os.path.abspath(raw)
+            if os.path.exists(abs_candidate):
+                return abs_candidate
+
+            # (2-b) 절대 경로지만 미존재 → basename 으로 스마트 검색 시도
+            target_name = os.path.basename(abs_candidate.rstrip("\\/"))
+            if target_name:
+                found = self._smart_search_file(base, target_name)
+                if found:
+                    return found
+            # 스마트 검색 실패 → 요청된 절대 경로 그대로 반환
+            return abs_candidate
+
+        # (3) active_project 결합 경로가 실제 존재 → 반환
+        joined = os.path.abspath(os.path.join(base, raw))
+        if os.path.exists(joined):
+            return joined
+
+        # (4) 파일명/상대경로 일부만 전달된 경우 → 하위 전수 스캔
+        target_name = os.path.basename(raw.rstrip("\\/"))
+        if target_name:
+            found = self._smart_search_file(base, target_name)
+            if found:
+                return found
+
+        # (5) 최종 폴백 — active_project 기준 결합 경로
+        return joined
+
+    # ------------------------------------------------------------------
+    # 3. 파일 경로 기반 프로젝트 자동 바인딩
+    # ------------------------------------------------------------------
+    def _find_project_root_for(self, file_path: str) -> Optional[str]:
+        """
+        주어진 파일 경로에서 상위로 올라가며 프로젝트 루트를 판별.
+
+        판정 우선순위:
+          1) Desktop 직계 하위 디렉터리 (가장 바깥쪽 = 실제 프로젝트 루트)
+          2) 강한 표식(.git / pyproject.toml / package.json 등) 보유 디렉터리
+          3) 약한 표식(README.md / main.py) 보유 디렉터리
+        Desktop 외부 경로는 자동 전환 대상에서 제외한다.
+
+        [버그 수정] Windows 드라이브 문자 대소문자(c: vs C:) 불일치로
+        `os.path.dirname(current) == desktop` 비교가 실패하여 자동 바인딩이
+        전혀 동작하지 않던 문제를 _norm() 기반 비교로 해결.
+        """
+        target = os.path.abspath(file_path)
+        if not os.path.exists(target):
+            target = os.path.dirname(target)
+
+        current = os.path.dirname(target) if os.path.isfile(target) else target
+
+        # Desktop 경로를 대소문자 무관 정규화 형태로 보관
+        desktop_norm = _norm(self.desktop_path)
+        desktop_child: Optional[str] = None
+        strong_root: Optional[str] = None
+        weak_root: Optional[str] = None
+
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+
+            # Desktop 직계 하위 디렉터리 — 가장 바깥쪽(먼저 만난 것)을 프로젝트 루트로 확정
+            # (대소문자 무관 비교: c:\Users\... 와 C:\Users\... 를 동일 취급)
+            if desktop_child is None and _norm(os.path.dirname(current)) == desktop_norm:
+                desktop_child = current
+
+            if strong_root is None:
+                for marker in STRONG_MARKERS:
+                    if os.path.exists(os.path.join(current, marker)):
+                        strong_root = current
+                        break
+
+            if weak_root is None:
+                for marker in WEAK_MARKERS:
+                    if os.path.exists(os.path.join(current, marker)):
+                        weak_root = current
+                        break
+
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+        def _under_desktop(p: Optional[str]) -> bool:
+            """p 가 Desktop 내부(또는 Desktop 자신)인지 대소문자 무관하게 판정."""
+            if not p:
+                return False
+            p_norm = _norm(p)
+            if not p_norm:
+                return False
+            return p_norm == desktop_norm or p_norm.startswith(desktop_norm + os.sep)
+
+        # 우선순위 1: Desktop 직계 하위 디렉터리 = 프로젝트 루트
+        if _under_desktop(desktop_child):
+            return os.path.abspath(desktop_child)
+        # 우선순위 2: 강한 표식 디렉터리
+        if _under_desktop(strong_root):
+            return os.path.abspath(strong_root)
+        # 우선순위 3: 약한 표식 디렉터리
+        if _under_desktop(weak_root):
+            return os.path.abspath(weak_root)
+        return None
+
+    def auto_bind_project_for_file(self, file_path: str) -> str:
+        """
+        파일 경로가 속한 프로젝트로 active_project 를 즉시 자동 전환(rebind).
+        전환 발생 시 config.json 에 영구 저장하고 로그를 남긴다.
+        반환값: 최종 active_project 경로.
+
+        [버그 수정] `os.path.abspath(root) == os.path.abspath(self.active_project)`
+        비교는 드라이브 문자 대소문자 차이(c: vs C:)를 구분하여, 이미 올바른
+        프로젝트에 바인딩되어 있어도 매 호출마다 불필요한 재전환/재저장이
+        발생하던 문제를 _norm() 기반 비교로 해결.
+        """
+        if not file_path:
+            return self.active_project
+
+        root = self._find_project_root_for(file_path)
+        if not root:
+            logger.debug("[ProjectManager] 자동 바인딩 대상 아님(Desktop 외부): %s", file_path)
+            return self.active_project
+
+        # 대소문자 무관 동일 경로 판정 — 이미 바인딩된 프로젝트면 조기 반환
+        if _norm(root) == _norm(self.active_project):
+            return self.active_project
+
+        previous = self.active_project
+        self.active_project = os.path.abspath(root)
+
+        # config.json 경로도 새 프로젝트 기준으로 재탐색
+        new_config = self._discover_config_path(self.active_project)
+        if new_config and os.path.isfile(new_config):
+            self.config_path = new_config
+            self.config = self._load_config()
+
+        self.save_config({"active_project": self.active_project})
+
+        logger.info(
+            "[ProjectManager] 프로젝트 자동 전환: %s → %s (트리거 파일: %s)",
+            previous, self.active_project, file_path,
+        )
+        return self.active_project
+
+    # ------------------------------------------------------------------
+    # 4. 활성 프로젝트 전환 + 영구 저장
+    # ------------------------------------------------------------------
+    def set_active_project(self, project_path: str) -> bool:
+        """프로젝트 전환. 유효 디렉터리일 때만 성공하며 config.json 에 저장."""
+        if not project_path:
+            return False
+
+        candidate = os.path.abspath(os.path.expanduser(str(project_path).strip().strip('"')))
+        if not (os.path.exists(candidate) and os.path.isdir(candidate)):
+            logger.warning("[ProjectManager] 전환 실패(디렉터리 아님): %s", candidate)
+            return False
+
+        previous = self.active_project
+        self.active_project = candidate
+
+        new_config = self._discover_config_path(candidate)
+        if new_config and os.path.isfile(new_config):
+            self.config_path = new_config
+            self.config = self._load_config()
+
+        ok = self.save_config({"active_project": self.active_project})
+        logger.info("[ProjectManager] 활성 프로젝트 전환: %s → %s (저장=%s)",
+                    previous, self.active_project, ok)
+        return True
+
+    # ------------------------------------------------------------------
+    # 5. Desktop 내 유효 프로젝트 동적 스캔
+    # ------------------------------------------------------------------
+    def _is_valid_project_dir(self, path: str) -> bool:
+        """프로젝트로 인정할 만한 디렉터리인지 판정."""
+        if not os.path.isdir(path):
+            return False
+        name = os.path.basename(path)
+        if name.startswith(".") or name in SKIP_DIRS:
+            return False
+        for marker in PROJECT_MARKERS:
+            if os.path.exists(os.path.join(path, marker)):
+                return True
+        # 표식이 없어도 하위에 소스 파일이 있으면 프로젝트로 간주
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file() and entry.name.lower().endswith((".py", ".js", ".ts", ".bat")):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def list_available_projects(self) -> List[Dict[str, Any]]:
+        """Desktop 하위의 모든 유효 프로젝트 디렉터리를 동적으로 스캔."""
+        projects: List[Dict[str, Any]] = []
+        desktop = os.path.abspath(self.desktop_path)
+        desktop_norm = _norm(desktop)
+        active_norm = _norm(self.active_project) if self.active_project else ""
+
+        if not os.path.isdir(desktop):
+            logger.warning("[ProjectManager] Desktop 경로 없음: %s", desktop)
+            return projects
+
+        try:
+            entries = sorted(os.scandir(desktop), key=lambda e: e.name.lower())
+        except Exception as e:
+            logger.error("[ProjectManager] Desktop 스캔 실패: %s", e)
+            return projects
+
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+            except Exception:
+                continue
+
+            path = os.path.abspath(entry.path)
+            if not self._is_valid_project_dir(path):
+                continue
+
+            projects.append({
+                "name": entry.name,
+                "path": path,
+                "is_active": (_norm(path) == active_norm),
+                "has_config": os.path.isfile(os.path.join(path, CONFIG_FILENAME)),
+            })
+
+        # 활성 프로젝트가 Desktop 하위인데 목록에 없으면 강제 포함
+        if active_norm and active_norm.startswith(desktop_norm + os.sep):
+            if not any(_norm(p["path"]) == active_norm for p in projects):
+                projects.insert(0, {
+                    "name": os.path.basename(self.active_project),
+                    "path": os.path.abspath(self.active_project),
+                    "is_active": True,
+                    "has_config": os.path.isfile(os.path.join(self.active_project, CONFIG_FILENAME)),
+                })
+
+        return projects
+
+    # ------------------------------------------------------------------
+    # 기존 기능 유지 — 파일 트리
+    # ------------------------------------------------------------------
+    def get_file_tree(self, max_depth: int = 4) -> Dict[str, Any]:
+        root = self.active_project
+        if not root or not os.path.exists(root):
+            return {"name": "Not Found", "type": "dir", "children": []}
+
+        def build_tree(current_path: str, depth: int) -> Dict[str, Any]:
+            name = os.path.basename(current_path) or current_path
+            if depth > max_depth:
+                return {"name": name, "path": current_path, "type": "dir", "children": []}
+
+            children: List[Dict[str, Any]] = []
+            try:
+                entries = sorted(os.scandir(current_path),
+                                 key=lambda e: (not e.is_dir(), e.name.lower()))
+                for entry in entries:
+                    if entry.name in SKIP_DIRS or entry.name.startswith(".git"):
+                        continue
+                    try:
+                        if entry.is_dir():
+                            children.append(build_tree(entry.path, depth + 1))
+                        else:
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            children.append({
+                                "name": entry.name,
+                                "path": entry.path,
+                                "type": "file",
+                                "ext": ext,
+                                "size": entry.stat().st_size,
+                            })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            return {"name": name, "path": current_path, "type": "dir", "children": children}
+
+        return build_tree(root, 1)
+
+    # ------------------------------------------------------------------
+    # 기존 기능 유지 — 파일 읽기/쓰기
+    # ------------------------------------------------------------------
+    def read_file_content(self, file_path: str) -> Dict[str, Any]:
+        target = self.resolve_path(file_path)
+        if not os.path.exists(target) or os.path.isdir(target):
+            return {"success": False, "error": "File does not exist", "path": target}
+
+        for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr", "latin1"):
+            try:
+                with open(target, "r", encoding=enc) as f:
+                    content = f.read()
+                return {"success": True, "content": content, "encoding": enc, "path": target}
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                return {"success": False, "error": str(e), "path": target}
+
+        return {"success": False, "error": "Unable to decode file", "path": target}
+
+    def save_file_content(self, file_path: str, content: str) -> Dict[str, Any]:
+        """
+        파일 저장 (지능형 경로 해석 기반).
+
+        절차:
+          (1) resolve_path() 로 대상 경로 해석 (스마트 검색 포함)
+          (2) 대상이 디렉터리이면 명시적 거부 — 오류 메시지 반환
+              (open(target, "w") 호출 시 Windows [Errno 13] Permission denied
+               문자열이 그대로 프런트엔드에 노출되던 문제를 사전 차단)
+          (3) 디렉터리가 아니면 parent 디렉터리 자동 생성 후 utf-8 로 안전 기록
+        """
+        target = self.resolve_path(file_path)
+
+        # (2) 디렉터리 대상 방어 — open() 호출 전에 명시적으로 거부
+        if os.path.isdir(target):
+            logger.warning("[ProjectManager] 저장 거부(디렉터리): %s", target)
+            return {
+                "success": False,
+                "error": f"Target is a directory: {target}",
+                "path": target,
+            }
+
+        # (3) parent 자동 생성 + utf-8 안전 기록
+        try:
+            parent = os.path.dirname(target)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content if isinstance(content, str) else str(content))
+            logger.info("[ProjectManager] 저장 완료: %s", target)
+            return {"success": True, "message": "Saved successfully", "path": target}
+        except Exception as e:
+            logger.error("[ProjectManager] 저장 실패: %s (%s)", target, e)
+            return {"success": False, "error": str(e), "path": target}
+
+    # ------------------------------------------------------------------
+    # 대용량 파일 정밀 부분 패치 엔진 (SEARCH / REPLACE)
+    # ------------------------------------------------------------------
+    # 패치 블록 형식 (Aider / Claude 계열 표준):
+    #
+    #   <<<<<<< SEARCH
+    #   ...원본에서 찾을 코드...
+    #   =======
+    #   ...대체할 코드...
+    #   >>>>>>> REPLACE
+    #
+    # 대용량 파일(수천 줄)을 통째로 재작성하지 않고, 국소 구간만 정밀 치환하여
+    # 토큰 낭비와 회귀 위험을 동시에 줄이는 것이 목적이다.
+    # ------------------------------------------------------------------
+    PATCH_BLOCK_PATTERN = re.compile(
+        r'<<<<<<< SEARCH\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>>> REPLACE',
+        re.DOTALL,
+    )
+
+    @staticmethod
+    def _normalize_newlines(text: str) -> str:
+        """CRLF / CR / LF 를 모두 LF 로 통일한다."""
+        if not text:
+            return ""
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    @staticmethod
+    def _strip_all_whitespace(text: str) -> str:
+        """모든 공백 문자(스페이스/탭/개행)를 제거한 비교용 문자열을 만든다."""
+        if not text:
+            return ""
+        return re.sub(r'\s+', '', text)
+
+    def _find_chunk_span(self, haystack: str, needle: str) -> Optional[tuple]:
+        """
+        haystack(원본) 안에서 needle(search_chunk)의 (start, end) 위치를 찾는다.
+
+        치환 안정성 3단 폴백:
+          (1) 정확 일치            — 원본 그대로 존재
+          (2) 줄바꿈 정규화 일치    — CRLF/LF 혼용 차이 흡수
+          (3) 공백 제거 일치        — 들여쓰기/공백 변형 흡수
+
+        반환: (start, end) 튜플 또는 None
+        """
+        if not needle:
+            return None
+
+        # (1) 정확 일치
+        idx = haystack.find(needle)
+        if idx >= 0:
+            return (idx, idx + len(needle))
+
+        # (2) 줄바꿈 정규화 일치 — 원본과 needle 을 모두 LF 로 통일한 뒤 탐색.
+        #     정규화 문자열의 인덱스는 원본과 1:1 대응하지 않으므로,
+        #     원본을 LF 로 통일한 사본에서 위치를 찾고 그 사본을 기준으로 치환한다.
+        norm_hay = self._normalize_newlines(haystack)
+        norm_needle = self._normalize_newlines(needle)
+        idx = norm_hay.find(norm_needle)
+        if idx >= 0:
+            return ("__NORMALIZED__", idx, idx + len(norm_needle))
+
+        # (3) 공백 제거 일치 — 공백을 모두 제거한 뒤 부분 문자열 탐색.
+        #     위치 역산이 불가능하므로 원본을 '라인 단위'로 재조립하며 매칭한다.
+        target_sig = self._strip_all_whitespace(needle)
+        if not target_sig:
+            return None
+
+        lines = haystack.splitlines(keepends=True)
+        # 라인 누적 시그니처를 만들어, 연속 라인 구간의 시그니처가 target_sig 와
+        # 일치하는 최초 구간을 찾는다.
+        for start_line in range(len(lines)):
+            acc = ""
+            for end_line in range(start_line, len(lines)):
+                acc += self._strip_all_whitespace(lines[end_line])
+                if acc == target_sig:
+                    start_off = sum(len(l) for l in lines[:start_line])
+                    end_off = start_off + sum(len(l) for l in lines[start_line:end_line + 1])
+                    return (start_off, end_off)
+                if len(acc) > len(target_sig):
+                    break
+
+        return None
+
+    def apply_search_replace(self, file_path: str, patch_text: str) -> Dict[str, Any]:
+        """
+        대용량 파일 정밀 부분 패치 엔진.
+
+        patch_text 안의 모든 SEARCH/REPLACE 블록을 순서대로 적용한다.
+
+        반환 계약:
+          {
+            "success": bool,          # 모든 블록이 적용되었는지 여부
+            "applied": int,           # 실제 치환에 성공한 블록 수
+            "total": int,             # 파싱된 전체 블록 수
+            "failed": [ {...}, ... ], # 실패한 블록 상세 (index / reason / search 미리보기)
+            "path": str,              # 실제 기록된 절대 경로
+            "message": str,           # 사람이 읽는 요약
+            "saved": bool,            # 디스크 기록 성공 여부
+          }
+
+        동작 원칙:
+          - 블록이 하나도 파싱되지 않으면 파일을 절대 건드리지 않는다.
+          - 적용된 블록이 0건이면 디스크에 쓰지 않는다(불필요한 mtime 변경 방지).
+          - 일부 실패하더라도 성공한 블록은 저장하고, 실패 내역을 함께 반환한다.
+        """
+        result: Dict[str, Any] = {
+            "success": False,
+            "applied": 0,
+            "total": 0,
+            "failed": [],
+            "path": "",
+            "message": "",
+            "saved": False,
+        }
+
+        # (0) 입력 방어
+        if not file_path or not str(file_path).strip():
+            result["message"] = "대상 파일 경로가 비어 있습니다."
+            return result
+        if not patch_text or not str(patch_text).strip():
+            result["message"] = "패치 텍스트가 비어 있습니다."
+            return result
+
+        # (1) 대상 파일 읽기
+        read_res = self.read_file_content(file_path)
+        if not read_res.get("success"):
+            result["path"] = read_res.get("path", "")
+            result["message"] = "대상 파일 읽기 실패: %s" % read_res.get("error")
+            return result
+
+        original = read_res.get("content", "") or ""
+        target_path = read_res.get("path", "")
+        result["path"] = target_path
+
+        # (2) 모든 SEARCH/REPLACE 블록 파싱
+        blocks = self.PATCH_BLOCK_PATTERN.findall(patch_text)
+        result["total"] = len(blocks)
+        if not blocks:
+            result["message"] = (
+                "패치 블록을 찾지 못했습니다. "
+                "'<<<<<<< SEARCH / ======= / >>>>>>> REPLACE' 형식을 확인하십시오."
+            )
+            return result
+
+        # (3) 순차 치환
+        current = original
+        applied = 0
+        failed: List[Dict[str, Any]] = []
+
+        for idx, (search_chunk, replace_chunk) in enumerate(blocks, start=1):
+            span = self._find_chunk_span(current, search_chunk)
+
+            if span is None:
+                failed.append({
+                    "index": idx,
+                    "reason": "SEARCH 구간을 원본에서 찾지 못했습니다.",
+                    "search_preview": (search_chunk or "")[:200],
+                })
+                logger.warning(
+                    "[ProjectManager] 패치 블록 %d/%d 실패 — SEARCH 미발견",
+                    idx, len(blocks),
+                )
+                continue
+
+            # (2) 줄바꿈 정규화 폴백으로 찾은 경우 — 정규화 사본 기준으로 치환
+            if isinstance(span, tuple) and len(span) == 3 and span[0] == "__NORMALIZED__":
+                _, s, e = span
+                norm_current = self._normalize_newlines(current)
+                norm_replacement = self._normalize_newlines(replace_chunk)
+                current = norm_current[:s] + norm_replacement + norm_current[e:]
+            else:
+                s, e = span
+                current = current[:s] + replace_chunk + current[e:]
+
+            applied += 1
+            logger.info(
+                "[ProjectManager] 패치 블록 %d/%d 적용 완료 (%s)",
+                idx, len(blocks), target_path,
+            )
+
+        result["applied"] = applied
+        result["failed"] = failed
+
+        # (4) 적용 0건이면 디스크 기록 생략 (불필요한 파일 변경 방지)
+        if applied == 0:
+            result["success"] = False
+            result["message"] = (
+                "적용된 블록이 없어 파일을 수정하지 않았습니다. (총 %d블록 전부 실패)" % len(blocks)
+            )
+            return result
+
+        # (5) save_file_content 로 안전 저장
+        save_res = self.save_file_content(target_path, current)
+        result["saved"] = bool(save_res.get("success"))
+        result["path"] = save_res.get("path", target_path)
+
+        if not save_res.get("success"):
+            result["success"] = False
+            result["message"] = "치환은 성공했으나 디스크 저장 실패: %s" % save_res.get("error")
+            return result
+
+        # (6) 최종 결과 정리
+        result["success"] = (len(failed) == 0)
+        if failed:
+            result["message"] = (
+                "%d/%d 블록 적용 후 저장 완료 (실패 %d건)" % (applied, len(blocks), len(failed))
+            )
+        else:
+            result["message"] = "%d/%d 블록 전량 적용 후 저장 완료" % (applied, len(blocks))
+
+        logger.info(
+            "[ProjectManager] apply_search_replace 완료: %s (%d/%d, 실패 %d)",
+            result["path"], applied, len(blocks), len(failed),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # 편의 접근자
+    # ------------------------------------------------------------------
+    def get_active_project(self) -> str:
+        return self.active_project
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active_project": self.active_project,
+            "config_path": self.config_path,
+            "desktop_path": self.desktop_path,
+            "config": self.config,
+        }

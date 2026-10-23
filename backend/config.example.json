@@ -1,0 +1,16 @@
+{
+  "_comment": "DeepSeek Antigravity IDE 설정 예시 템플릿입니다. 이 파일을 backend/config.json 으로 복사한 뒤 api_key 를 실제 키로 교체하십시오. backend/config.json 은 .gitignore 에 의해 커밋이 차단됩니다.",
+  "api_key": "YOUR_DEEPSEEK_API_KEY_HERE",
+  "deepseek_api_key": "YOUR_DEEPSEEK_API_KEY_HERE",
+  "model_reasoner": "deepseek-reasoner",
+  "model_chat": "deepseek-chat",
+  "active_project": "C:\\Users\\YOUR_USERNAME\\Desktop\\DeepSeek_Antigravity_IDE",
+  "monitored_projects": [
+    "C:\\Users\\YOUR_USERNAME\\Desktop\\project_1",
+    "C:\\Users\\YOUR_USERNAME\\Desktop\\project_2"
+  ],
+  "watchdog_enabled": true,
+  "watchdog_interval_seconds": 2,
+  "server_port": 8890,
+  "theme": "dark"
+}

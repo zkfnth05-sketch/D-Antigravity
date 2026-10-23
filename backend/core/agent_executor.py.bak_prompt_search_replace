@@ -1,0 +1,1120 @@
+# -*- coding: utf-8 -*-
+"""
+Antigravity AgentExecutor — 전면 개편판
+=========================================================================
+개편 핵심 4대 원칙:
+  1) _build_context_inventory() 의 'kmarket-marketing-engine' 하드코딩 완전 제거
+     → self.pm.active_project 하위 디렉터리를 동적 스캔하여 실제 파이썬 패키지 /
+       주요 모듈 폴더를 지능적으로 식별 (마케팅봇·아우라·어떤 앱이든 고유 구조 파악)
+  2) execute_user_request / run_autonomous_turn 진입 시 context_file 이 주어지면
+     self.pm.auto_bind_project_for_file(context_file) 로 active_project 즉시 rebind
+  3) tool_read_file / tool_write_file / tool_list_files 등 모든 파일 작업에서
+     self.pm.resolve_path() 우선 정규화
+  4) tool_write_file 실행 후 대상이 .py 이면 즉시 py_compile 문법 검증 →
+     반환 객체(syntax) + SessionMemory(작업 메모리)에 명확히 기록
+=========================================================================
+"""
+import os
+import re
+import json
+import asyncio
+import py_compile
+from typing import Dict, Any, List, Callable, Optional
+
+from core.session_memory import SessionMemory
+
+
+def decode_bytes(b: bytes) -> str:
+    if not b:
+        return ""
+    for enc in ["cp949", "utf-8", "euc-kr"]:
+        try:
+            return b.decode(enc).strip()
+        except Exception:
+            pass
+    return b.decode("latin1", errors="replace").strip()
+
+
+# =========================================================================
+# DeepSeek 공식 Function Calling Tools 스키마
+# =========================================================================
+NATIVE_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "프로젝트 내 파일의 실제 전체 코드를 처음부터 끝까지 온전히 읽어옵니다. 절대로 중간에 자르지 않습니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "읽을 파일의 상대 또는 절대 경로"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "프로젝트 내 파일에 코드를 실제로 작성하거나 수정합니다. 화면 에디터에 즉시 반영됩니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "수정/저장할 파일 경로"},
+                    "content": {"type": "string", "description": "작성할 전체 코드 내용"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "터미널 명령어나 파이썬 스크립트(pytest, python xxx.py 등)를 프로젝트 디렉터리에서 실제로 구동하고 결과를 확인합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string", "description": "실행할 터미널 명령어"}
+                },
+                "required": ["cmd"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "프로젝트 내 특정 폴더의 파일 및 하위 디렉터리 목록을 조회합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "조회할 폴더 상대 경로 (기본값 빈문자열: 프로젝트 루트)"}
+                }
+            }
+        }
+    }
+]
+
+# 인벤토리 스캔 시 제외할 노이즈 디렉터리
+_SKIP_DIRS = {
+    ".git", ".idea", ".vscode", "__pycache__", "node_modules", "venv", "env",
+    ".venv", "build", "dist", "site-packages", ".pytest_cache", ".mypy_cache",
+    ".next", ".cache", "logs", "log", "tmp", "temp", "backup", "backups",
+    ".gradle", "target", "bin", "obj", "assets", "static", "media"
+}
+
+# 주요 모듈 폴더로 간주할 이름 힌트 (가중치 부여)
+_KEY_DIR_HINTS = (
+    "core", "engine", "module", "modules", "app", "apps", "src", "source",
+    "backend", "frontend", "server", "api", "service", "services", "agent",
+    "agents", "bot", "bots", "crawler", "scraper", "pipeline", "worker",
+    "workers", "task", "tasks", "scheduler", "daemon", "utils", "common",
+    "lib", "libs", "handler", "handlers", "router", "routes", "model",
+    "models", "view", "views", "controller", "controllers", "brands",
+    "marketing", "publish", "publisher", "content", "factory", "collector"
+)
+
+
+class AgentExecutor:
+    """
+    Antigravity DeepSeek 엔터프라이즈급 공식 Function Calling 에이전트
+    - 다중 대화 맥락 기억 엔진 (SessionMemory) 완벽 내장
+    - 파일 자름 현상(Truncation) 영구 제거 (최대 10만 자 온전한 전수 독해)
+    - 이전 대화, 수정 이력, 도구 실행 결과를 100% 기억하여 자율 협업
+    - 프로젝트 구조 동적 인벤토리 (하드코딩 제로)
+    - context_file 기반 active_project 자동 rebind
+    - .py 저장 시 즉시 py_compile 문법 검증
+    """
+
+    def __init__(self, deepseek_client, project_manager):
+        self.llm = deepseek_client
+        self.pm = project_manager
+        self.memory = SessionMemory(max_history_turns=24)
+
+    # =====================================================================
+    # [3] 경로 정규화 단일 창구 — pm.resolve_path() 우선
+    # =====================================================================
+    def _resolve_path(self, path: str) -> str:
+        """
+        모든 파일 작업의 단일 경로 정규화 창구.
+        pm.resolve_path() 를 최우선 사용하고, 실패 시에만 절대/상대 폴백.
+        """
+        if not path:
+            return self.pm.active_project
+        try:
+            resolved = self.pm.resolve_path(path)
+            if resolved:
+                return resolved
+        except Exception:
+            pass
+        if os.path.isabs(path):
+            return os.path.abspath(path)
+        return os.path.abspath(os.path.join(self.pm.active_project, path))
+
+    # =====================================================================
+    # [2][5] context_file 기반 active_project 자동 rebind + 기억 격리/복원
+    # =====================================================================
+    def _rebind_project_for_context(self, context_file: str) -> str:
+        """
+        context_file 이 주어지면 해당 파일이 속한 프로젝트로 active_project 즉시 전환.
+        전환 직후 SessionMemory 를 새 프로젝트에 바인딩하여
+          - 이전 프로젝트의 대화/수정 이력은 디스크로 flush(보존)
+          - 새 프로젝트의 대화/수정 이력은 디스크에서 자동 로드(복원)
+        → 프로젝트 간 기억 100% 격리.
+        반환: rebind 후의 active_project 경로
+        """
+        raw = (context_file or "").strip().strip("\"'`").strip()
+        if not raw:
+            # context_file 이 없어도 현재 프로젝트 기억은 항상 보장
+            try:
+                self.memory.bind_project(self.pm.active_project)
+            except Exception:
+                pass
+            return self.pm.active_project
+
+        bound = ""
+        try:
+            resolved = self._resolve_path(raw)
+            bound = self.pm.auto_bind_project_for_file(resolved)
+        except Exception:
+            bound = ""
+
+        # [핵심 배선] active_project 전환 후 세션 메모리를 해당 프로젝트로 재바인딩
+        # → 이전 앱 기억 flush + 새 앱 기억 디스크 로드 (완전 격리)
+        try:
+            self.memory.bind_project(bound or self.pm.active_project)
+        except Exception:
+            pass
+
+        return bound or self.pm.active_project
+
+    # =====================================================================
+    # [4] 파이썬 문법 검증 (py_compile)
+    # =====================================================================
+    def _verify_python_syntax(self, full_path: str) -> Dict[str, Any]:
+        """
+        대상 .py 파일에 대해 py_compile 문법 검증을 즉시 수행.
+        반환: {"checked": bool, "valid": bool, "message": str, "error": str}
+        """
+        result = {
+            "checked": False,
+            "valid": True,
+            "message": "파이썬 파일이 아니므로 문법 검증 생략",
+            "error": ""
+        }
+        if not full_path.lower().endswith(".py"):
+            return result
+
+        result["checked"] = True
+        try:
+            py_compile.compile(full_path, cfile=None, doraise=True, optimize=-1)
+            result["valid"] = True
+            result["message"] = "✅ py_compile 문법 검증 통과 (오류 0건)"
+            return result
+        except py_compile.PyCompileError as e:
+            result["valid"] = False
+            result["error"] = str(e).strip()
+            result["message"] = f"❌ py_compile 문법 오류 발견: {result['error'][:400]}"
+            return result
+        except Exception as e:
+            result["valid"] = False
+            result["error"] = str(e).strip()
+            result["message"] = f"❌ 문법 검증 실행 오류: {result['error'][:400]}"
+            return result
+
+    # =====================================================================
+    # [1] 프로젝트 구조 동적 인벤토리 (하드코딩 완전 제거)
+    # =====================================================================
+    def _scan_subdirectory(self, dir_path: str, max_items: int = 18) -> List[str]:
+        """단일 하위 디렉터리의 항목 목록 (노이즈 제외)."""
+        items: List[str] = []
+        try:
+            entries = sorted(os.scandir(dir_path), key=lambda e: (not e.is_dir(), e.name.lower()))
+            for entry in entries:
+                if entry.name.startswith((".", "__pycache__")):
+                    continue
+                items.append(f"{entry.name}/" if entry.is_dir() else entry.name)
+                if len(items) >= max_items:
+                    break
+        except Exception:
+            pass
+        return items
+
+    def _is_python_package(self, dir_path: str) -> bool:
+        """__init__.py 존재 여부로 실제 파이썬 패키지 판별."""
+        try:
+            return os.path.isfile(os.path.join(dir_path, "__init__.py"))
+        except Exception:
+            return False
+
+    def _count_python_files(self, dir_path: str, max_depth: int = 2) -> int:
+        """디렉터리 내 .py 파일 개수 (제한 깊이)."""
+        count = 0
+        base_depth = dir_path.rstrip("\\/").count(os.sep)
+        try:
+            for current, dirs, files in os.walk(dir_path):
+                depth = current.rstrip("\\/").count(os.sep) - base_depth
+                if depth >= max_depth:
+                    dirs[:] = []
+                dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+                count += sum(1 for f in files if f.lower().endswith(".py"))
+                if count > 500:
+                    break
+        except Exception:
+            pass
+        return count
+
+    def _discover_key_directories(self, project_root: str, max_dirs: int = 8) -> List[Dict[str, Any]]:
+        """
+        active_project 하위 디렉터리를 동적 스캔하여
+        '실제 파이썬 패키지' 또는 '주요 모듈 폴더'를 지능적으로 식별.
+        점수 기반 정렬 후 상위 max_dirs 개 반환.
+        """
+        candidates: List[Dict[str, Any]] = []
+        try:
+            entries = [e for e in os.scandir(project_root) if e.is_dir()]
+        except Exception:
+            return []
+
+        for entry in entries:
+            name = entry.name
+            if name.startswith(".") or name.lower() in _SKIP_DIRS:
+                continue
+
+            is_pkg = self._is_python_package(entry.path)
+            py_count = self._count_python_files(entry.path)
+            if py_count == 0 and not is_pkg:
+                continue  # 파이썬과 무관한 폴더는 인벤토리에서 제외
+
+            score = 0
+            if is_pkg:
+                score += 100
+            score += min(py_count, 60)
+            lname = name.lower()
+            if lname in _KEY_DIR_HINTS:
+                score += 40
+            elif any(h in lname for h in _KEY_DIR_HINTS):
+                score += 20
+
+            candidates.append({
+                "name": name,
+                "path": entry.path,
+                "is_package": is_pkg,
+                "py_count": py_count,
+                "score": score
+            })
+
+        candidates.sort(key=lambda c: (-c["score"], c["name"].lower()))
+        return candidates[:max_dirs]
+
+    def _build_context_inventory(self) -> str:
+        """
+        [개편 핵심] 'kmarket-marketing-engine' 하드코딩 완전 제거.
+        active_project 내부를 동적으로 스캔하여 어떤 앱이든 고유 구조를 정확히 파악.
+        """
+        try:
+            proj = self.pm.active_project
+            if not proj or not os.path.isdir(proj):
+                return f"- 현재 작업 프로젝트: (경로 없음) {proj}"
+
+            proj_name = os.path.basename(proj.rstrip("\\/"))
+
+            # 1) 루트 파일 / 루트 디렉터리 분리 수집
+            root_files: List[str] = []
+            root_dirs: List[str] = []
+            try:
+                entries = sorted(os.scandir(proj), key=lambda e: (not e.is_dir(), e.name.lower()))
+                for entry in entries:
+                    if entry.name.startswith((".", "__pycache__")):
+                        continue
+                    if entry.is_dir():
+                        if entry.name.lower() in _SKIP_DIRS:
+                            continue
+                        root_dirs.append(entry.name)
+                    else:
+                        root_files.append(entry.name)
+            except Exception:
+                pass
+
+            # 2) 주요 모듈 폴더 지능 식별 (동적)
+            key_dirs = self._discover_key_directories(proj)
+
+            lines: List[str] = []
+            lines.append(f"- 현재 작업 프로젝트: {proj_name}")
+            lines.append(f"- 프로젝트 절대 경로: {proj}")
+            lines.append(f"- 루트 파일 목록 ({len(root_files)}개): {', '.join(root_files[:30]) or '없음'}")
+            lines.append(f"- 루트 디렉터리 ({len(root_dirs)}개): {', '.join(root_dirs[:20]) or '없음'}")
+
+            # 3) 주요 모듈 폴더별 상세 인벤토리 (동적)
+            if key_dirs:
+                lines.append("- [주요 모듈 폴더 동적 인벤토리]:")
+                for d in key_dirs:
+                    tag = "파이썬 패키지" if d["is_package"] else "모듈 폴더"
+                    items = self._scan_subdirectory(d["path"], max_items=18)
+                    lines.append(
+                        f"  · {d['name']}/ ({tag}, .py {d['py_count']}개): "
+                        f"{', '.join(items) or '비어 있음'}"
+                    )
+            else:
+                lines.append("- [주요 모듈 폴더 동적 인벤토리]: 하위 파이썬 모듈 폴더 없음 (단일 파일 프로젝트)")
+
+            # 4) 실행 진입점 후보 안내
+            entry_candidates = [
+                f for f in root_files
+                if f.lower().endswith(".py") and (
+                    f.lower() in ("main.py", "app.py", "server.py", "run.py", "manage.py")
+                    or f.lower().startswith("run_")
+                )
+            ]
+            if entry_candidates:
+                lines.append(f"- 실행 진입점 후보: {', '.join(entry_candidates[:10])}")
+
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    # =====================================================================
+    # Tool: read_file
+    # =====================================================================
+    def tool_read_file(self, path: str) -> Dict[str, Any]:
+        full_path = self._resolve_path(path)
+        res = self.pm.read_file_content(full_path)
+        if res.get("success"):
+            content = res.get("content", "")
+            lines = content.splitlines()
+            # 절대로 중간에 자르지 않고 최대 10만 자까지 온전히 제공
+            safe_content = content[:100000]
+            return {
+                "success": True,
+                "path": full_path,
+                "filename": os.path.basename(full_path),
+                "total_lines": len(lines),
+                "content": content,
+                "full_text": safe_content
+            }
+        return {"success": False, "error": f"파일 열기 실패: {res.get('error')}", "path": full_path}
+
+    # =====================================================================
+    # Tool: write_file (+ [4] py_compile 즉시 검증)
+    # =====================================================================
+    def tool_write_file(self, path: str, content: str) -> Dict[str, Any]:
+        # ------------------------------------------------------------------
+        # [안전 쓰기 파이프라인] 디렉터리 방어
+        # 모델이 path 대신 디렉터리(프로젝트 루트 등)를 넘기는 사고를 원천 차단.
+        #   1차: _current_context_file 이 유효한 '파일'이면 그쪽으로 자동 전환
+        #   2차: 그래도 디렉터리면 저장을 명시적으로 거부 (Permission denied 방지)
+        # ------------------------------------------------------------------
+        raw_path = (path or "").strip().strip("\"'`").strip()
+        full_path = self._resolve_path(raw_path)
+
+        if os.path.isdir(full_path):
+            ctx_cand = (getattr(self, '_current_context_file', '') or "").strip()
+            switched = False
+            if ctx_cand:
+                try:
+                    resolved_cand = self._resolve_path(ctx_cand)
+                except Exception:
+                    resolved_cand = ""
+                if resolved_cand and not os.path.isdir(resolved_cand):
+                    full_path = resolved_cand
+                    switched = True
+
+            if not switched or os.path.isdir(full_path):
+                return {
+                    "success": False,
+                    "path": full_path,
+                    "filename": os.path.basename(full_path.rstrip("\\/")),
+                    "lines": len((content or "").splitlines()),
+                    "content": content,
+                    "syntax": {
+                        "checked": False,
+                        "valid": False,
+                        "message": "디렉터리 경로 거부로 문법 검증 미실행",
+                        "error": ""
+                    },
+                    "error": (
+                        f"저장 거부: '{full_path}' 는 디렉터리입니다. "
+                        "파일 경로(예: backend/core/xxx.py)를 명시하십시오."
+                    )
+                }
+
+        res = self.pm.save_file_content(full_path, content)
+        lines = len(content.splitlines())
+        filename = os.path.basename(full_path)
+
+        if not res.get("success"):
+            return {
+                "success": False,
+                "path": full_path,
+                "filename": filename,
+                "lines": lines,
+                "content": content,
+                "syntax": {
+                    "checked": False,
+                    "valid": False,
+                    "message": "저장 실패로 문법 검증 미실행",
+                    "error": ""
+                },
+                "error": res.get("error", "저장 실패")
+            }
+
+        # [4] .py 파일이면 즉시 py_compile 문법 검증
+        syntax = self._verify_python_syntax(full_path)
+
+        # 작업 메모리에 파일 수정 이력 + 문법 검증 결과 영구 기록
+        if syntax.get("checked"):
+            if syntax.get("valid"):
+                summary = "DeepSeek 에이전트가 직접 코드 작성/수정 반영 완료 · py_compile 문법 검증 통과"
+            else:
+                summary = (
+                    "DeepSeek 에이전트가 직접 코드 작성/수정 반영 완료 · "
+                    f"⚠️ py_compile 문법 오류: {syntax.get('error', '')[:200]}"
+                )
+        else:
+            summary = "DeepSeek 에이전트가 직접 코드 작성/수정 반영 완료"
+
+        try:
+            self.memory.record_file_modification(filename, full_path, lines, summary)
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "path": full_path,
+            "filename": filename,
+            "lines": lines,
+            "content": content,
+            "syntax": syntax
+        }
+
+    # =====================================================================
+    # Tool: run_command
+    # =====================================================================
+    async def tool_run_command(self, cmd: str) -> str:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=self.pm.active_project,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+                out_str = decode_bytes(stdout)
+                err_str = decode_bytes(stderr)
+                res = f"[종료 코드: {proc.returncode}]\n"
+                if out_str:
+                    res += f"STDOUT:\n{out_str[:8000]}\n"
+                if err_str:
+                    res += f"STDERR:\n{err_str[:8000]}\n"
+                return res if (out_str or err_str) else f"[정상 종료 (출력 없음, 코드: {proc.returncode})]"
+            except asyncio.TimeoutError:
+                proc.kill()
+                return "[실행 시간 초과 (45초 초과 프로세스 종료)]"
+        except Exception as e:
+            return f"명령어 구동 오류: {str(e)}"
+
+    # =====================================================================
+    # Tool: list_files
+    # =====================================================================
+    def tool_list_files(self, rel_path: str = "") -> str:
+        target_dir = self._resolve_path(rel_path)
+        if not os.path.exists(target_dir):
+            return f"폴더가 존재하지 않음: {rel_path}"
+        try:
+            items = []
+            for entry in os.scandir(target_dir):
+                if entry.name.startswith((".", "__pycache__")):
+                    continue
+                tag = "[DIR]" if entry.is_dir() else "[FILE]"
+                items.append(f"{tag} {entry.name}")
+            return "\n".join(sorted(items)[:100])
+        except Exception as e:
+            return f"폴더 조회 에러: {e}"
+
+    # =====================================================================
+    # [방법 1] 딥시크의 보는 눈 — Turn 0 선제적 전수 독해 자동 주입
+    # =====================================================================
+    def _preload_context_file(self, context_file: str) -> str:
+        """
+        Turn 0 진입 시 대상 파일 전체를 실제로 읽어 시스템 프롬프트 주입용
+        텍스트 블록으로 변환한다.
+
+        반환 예시:
+            [현재 대상 파일 실시간 전수 독해] (총 977줄 독해 완료)
+            파일명: agent_executor.py
+            경로: C:\...\backend\core\agent_executor.py
+            ```python
+            {content}
+            ```
+
+        파일이 없거나 읽기 실패 시 빈 문자열을 반환한다(예외 미전파).
+        """
+        raw = (context_file or "").strip().strip("\"'`").strip()
+        if not raw:
+            return ""
+
+        try:
+            full_path = self._resolve_path(raw)
+        except Exception:
+            return ""
+
+        if not full_path or not os.path.isfile(full_path):
+            return ""
+
+        try:
+            res = self.tool_read_file(full_path)
+        except Exception:
+            return ""
+
+        if not res.get("success"):
+            return ""
+
+        content = res.get("content", "") or ""
+        filename = res.get("filename") or os.path.basename(full_path)
+        total_lines = res.get("total_lines", len(content.splitlines()))
+
+        # 확장자에 맞춰 코드펜스 언어 태그 결정
+        ext = os.path.splitext(full_path)[1].lower()
+        lang = {
+            ".py": "python", ".js": "javascript", ".ts": "typescript",
+            ".tsx": "tsx", ".jsx": "jsx", ".json": "json", ".html": "html",
+            ".css": "css", ".md": "markdown", ".bat": "bat", ".sh": "bash",
+            ".yml": "yaml", ".yaml": "yaml", ".sql": "sql"
+        }.get(ext, "")
+
+        block = (
+            f"[현재 대상 파일 실시간 전수 독해] (총 {total_lines}줄 독해 완료)\n"
+            f"파일명: {filename}\n"
+            f"경로: {full_path}\n"
+            f"```{lang}\n"
+            f"{content}\n"
+            f"```\n"
+        )
+        return block
+
+    # =====================================================================
+    # 시스템 프롬프트 조립
+    # =====================================================================
+    def _build_system_prompt(self, context_file: str, inventory: str,
+                             preloaded_code: str = "") -> str:
+        # ------------------------------------------------------------------
+        # [방법 1] 딥시크의 보는 눈 — Turn 0 선제적 전수 독해 섹션
+        # context_file 이 주어지고 preloaded_code 가 준비되면, 시스템 프롬프트
+        # 최상단에 파일 전체 코드를 그대로 주입하여 DeepSeek 이 시작하자마자
+        # (Turn 0) 파일 전체를 눈앞에 보면서 작업하도록 강제한다.
+        # ------------------------------------------------------------------
+        preload_section = ""
+        if preloaded_code:
+            preload_section = preloaded_code
+        elif context_file:
+            preload_section = (
+                "[현재 대상 파일 실시간 전수 독해] (파일 독해 실패)\n"
+                f"경로: {context_file}\n"
+                "※ 파일이 존재하지 않거나 읽기에 실패했습니다. "
+                "필요 시 read_file 도구로 직접 확인하십시오.\n"
+            )
+
+        return f"""당신은 'Antigravity Studio'의 최고 수석 자율 AI 코딩 엔지니어입니다.
+작업 디렉터리: {self.pm.active_project}
+현재 화면에 열린 파일: {context_file or '없음'}
+
+{preload_section}
+[프로젝트 사전 인벤토리]:
+{inventory}
+
+🚨 [대표님의 절대 행동 수칙 - 반드시 준수]:
+🚨 [핵심 행동 원칙 - 완성형 코드 블록 필수 출력 (시스템 디스크 자동 저장 연동)]:
+- 코드를 작성하거나 수정할 때는 반드시 파일 전체 코드를 온전한 파이썬 코드 블록(```python ... ```)으로 출력하십시오!
+- 출력된 최신 코드 블록은 MCP 서버의 디스크 강제 동기화 게이트가 자동으로 가로채 대상 파일에 100% 원자적으로 안전하게 저장합니다.
+- 절대로 중간 생략(...)이나 설명으로 때우지 말고 1줄부터 끝줄까지 100% 동작하는 완성 코드를 블록 내에 온전히 작성하십시오.
+- 파일을 수정한 후에는 반드시 `run_command`로 `python -m py_compile [파일명]` 또는 테스트를 실행하여 문법 오류가 없는지 직접 검증하십시오!
+
+1. [되묻기 및 지시대기 전면 금지]:
+   - "어느 파일을 읽을까요?", "어느 줄을 고칠까요?", "1번, 2번, 3번 중 골라주세요", "지시를 기다립니다"라는 질문을 절대 하지 마십시오.
+   - 당신은 100% 완전 자율 안티그래피티 AI입니다. 스스로 원인을 찾고, 코드를 고치고, 터미널로 검증하십시오.
+2. [비굴한 반성문 및 패배주의적 고백 금지]:
+   - "정직하게 고백합니다. 저는 아무것도 안 했습니다" 같은 무능한 반성문 작성을 일체 금지합니다.
+   - 이미 수정한 내역이 있다면 수정 상태와 diff를 기반으로 당당하게 보고하십시오.
+3. [대화 맥락 및 수정 이력 100% 인지]:
+   - 당신은 이전 대화 맥락과 작업 메모리를 모두 기억하고 있습니다.
+   - 사용자가 "뭘 수정했어?", "아까 그거 왜 그랬어?"라고 물으면 이전 대화와 작업 메모리를 근거로 정확하게 답변하십시오.
+4. [코드 독해 완결 원칙 - 중간에 끊기 금지]:
+   - 파일은 처음부터 끝까지 완전하게 읽고 분석하십시오.
+5. [결과 보고는 3줄 요약]:
+   - 📌 변경 파일: [파일명] (00줄 ➔ 00줄)
+   - 💡 핵심 해결: [무엇을 왜 어떻게 고쳤는지 1문장]
+   - 🔍 검증 결과: [문법 검증 완료, 상단 '🔀 변경점(Diff)' 탭에서 실시간 확인 가능]
+6. [100% 한국어 엄격 사용]:
+   - 모든 생각, 분석, 보고는 100% 품격 있고 명확한 한국어로만 작성하십시오.
+"""
+
+    # =====================================================================
+    # 메인 진입점 1: execute_user_request
+    # =====================================================================
+    async def execute_user_request(
+        self,
+        user_prompt: str,
+        context_file: str = "",
+        broadcast_fn: Optional[Callable] = None
+    ) -> str:
+        # [2] context_file 이 주어지면 active_project 즉시 rebind
+        self._rebind_project_for_context(context_file)
+        self._current_context_file = context_file
+
+        # [방법 1][Turn 0 선제적 전수 독해] 시작 즉시 파일 전체를 눈앞에 주입
+        preloaded_code = self._preload_context_file(context_file)
+
+        inventory = self._build_context_inventory()
+        system_prompt = self._build_system_prompt(context_file, inventory, preloaded_code)
+
+        # 1. 사용자 프롬프트를 영구 세션 메모리에 기록
+        self.memory.add_user_message(user_prompt)
+
+        # 2. [시스템 프롬프트 + 작업 메모리(수정파일목록) + 이전 대화 맥락] 자동 결합
+        messages = self.memory.get_messages_for_llm(system_prompt)
+
+        # Multi-turn Native Function Calling Loop (Up to 6 turns)
+        final_answer = ""
+        for turn in range(6):
+            ai_resp = await self.llm.call_llm_with_tools(
+                messages=messages,
+                tools=NATIVE_TOOLS_SCHEMA,
+                model=self.llm.model_chat,
+                temperature=0.2
+            )
+
+            content = ai_resp.get("content") or ""
+            tool_calls = ai_resp.get("tool_calls") or []
+
+            # Stream thought / interim message to UI
+            if content and broadcast_fn:
+                await broadcast_fn({
+                    "type": "agent_action",
+                    "data": {
+                        "speaker": "🤖 DeepSeek Agent",
+                        "role": "assistant",
+                        "message": content
+                    }
+                })
+
+            # If no tools called, check if the model proposed code blocks for a file and auto-apply!
+            if not tool_calls:
+                code_blocks = re.findall(r'```python\s*([\s\S]*?)```', content)
+                is_mod_req = any(
+                    kw in user_prompt
+                    for kw in ["수정", "고쳐", "에러", "해결", "자가치유", "반영", "바꿔", "패치"]
+                )
+
+                if code_blocks and is_mod_req and context_file:
+                    target_p = self._resolve_path(context_file)
+                    code_to_write = code_blocks[-1].strip()
+                    if len(code_to_write.splitlines()) > 5:
+                        write_res = self.tool_write_file(target_p, code_to_write)
+                        if write_res.get("success"):
+                            if broadcast_fn:
+                                await broadcast_fn({
+                                    "type": "file_modified",
+                                    "data": {
+                                        "path": write_res["path"],
+                                        "filename": write_res["filename"],
+                                        "content": write_res["content"],
+                                        "lines": write_res["lines"]
+                                    }
+                                })
+                                await broadcast_fn({
+                                    "type": "agent_action",
+                                    "data": {
+                                        "speaker": "🛠️ DeepSeek [코드 디스크 자동 반영]",
+                                        "role": "engineer",
+                                        "message": f"작성된 최신 코드를 파일에 자동 저장 완료: `{write_res['filename']}` ({write_res['lines']}줄)"
+                                    }
+                                })
+                            # [4] py_compile 결과 브로드캐스트
+                            syntax = write_res.get("syntax", {})
+                            if syntax.get("checked") and broadcast_fn:
+                                await broadcast_fn({
+                                    "type": "agent_action",
+                                    "data": {
+                                        "speaker": "🧪 파이썬 문법 검증 (py_compile)",
+                                        "role": "tester",
+                                        "message": syntax.get("message", "")
+                                    }
+                                })
+
+            # If no tools called, we are finished!
+            if not tool_calls:
+                final_answer = content or "요청하신 작업을 성공적으로 완결하였습니다."
+                self.memory.add_assistant_message(final_answer)
+                return final_answer
+
+            # Append assistant message with tool_calls
+            assistant_msg = {"role": "assistant", "content": content}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+            self.memory.add_assistant_message(content, tool_calls)
+
+            # Execute each official tool call
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name")
+                raw_args = func.get("arguments", "{}")
+                tc_id = tc.get("id", f"call_{turn}")
+
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+
+                tool_result_str = ""
+
+                # 1. READ FILE (온전한 전체 독해)
+                if name == "read_file":
+                    p = args.get("path") or args.get("file_path") or args.get("filePath") or args.get("target_file") or context_file or ""
+                    res = self.tool_read_file(p)
+                    if res.get("success"):
+                        tool_result_str = (
+                            f"[파일 읽기 성공: {res['filename']} "
+                            f"(총 {res['total_lines']}줄 온전히 독해 완료)]\n{res['full_text']}"
+                        )
+                        if broadcast_fn:
+                            await broadcast_fn({
+                                "type": "file_opened",
+                                "data": {
+                                    "path": res["path"],
+                                    "filename": res["filename"],
+                                    "content": res["content"]
+                                }
+                            })
+                            await broadcast_fn({
+                                "type": "agent_action",
+                                "data": {
+                                    "speaker": "📖 DeepSeek [파일 전수 독해 완료]",
+                                    "role": "tester",
+                                    "message": f"파일 전체 ({res['total_lines']}줄) 온전히 독해 완료: `{res['filename']}`"
+                                }
+                            })
+                    else:
+                        tool_result_str = f"[오류]: {res.get('error')}"
+
+                # 2. WRITE FILE (+ py_compile 즉시 검증)
+                elif name == "write_file":
+                    p = args.get("path") or args.get("file_path") or args.get("filePath") or args.get("target_file") or context_file or ""
+                    c = args.get("content", "")
+                    write_res = self.tool_write_file(p, c)
+                    if write_res.get("success"):
+                        syntax = write_res.get("syntax", {})
+                        tool_result_str = (
+                            f"[파일 수정 완료: {write_res['filename']}] "
+                            f"({write_res['lines']}줄 저장됨)\n"
+                            f"[py_compile 문법 검증]: {syntax.get('message', '검증 미실행')}"
+                        )
+                        if broadcast_fn:
+                            await broadcast_fn({
+                                "type": "file_modified",
+                                "data": {
+                                    "path": write_res["path"],
+                                    "filename": write_res["filename"],
+                                    "content": write_res["content"],
+                                    "lines": write_res["lines"]
+                                }
+                            })
+                            await broadcast_fn({
+                                "type": "agent_action",
+                                "data": {
+                                    "speaker": "🛠️ DeepSeek [코드 직접 수정 & 에디터 동기화]",
+                                    "role": "engineer",
+                                    "message": f"파일 및 화면 에디터에 코드 반영 완료: `{write_res['filename']}` ({write_res['lines']}줄)"
+                                }
+                            })
+                            if syntax.get("checked"):
+                                await broadcast_fn({
+                                    "type": "agent_action",
+                                    "data": {
+                                        "speaker": "🧪 파이썬 문법 검증 (py_compile)",
+                                        "role": "tester",
+                                        "message": syntax.get("message", "")
+                                    }
+                                })
+                    else:
+                        tool_result_str = f"[저장 실패]: {p} — {write_res.get('error', '')}"
+
+                # 3. RUN COMMAND
+                elif name == "run_command":
+                    cmd = args.get("cmd", "")
+                    if broadcast_fn:
+                        await broadcast_fn({
+                            "type": "agent_action",
+                            "data": {
+                                "speaker": "⚡ DeepSeek [터미널 실제 구동]",
+                                "role": "deployer",
+                                "message": f"터미널 실행 중: `{cmd}`"
+                            }
+                        })
+                    cmd_res = await self.tool_run_command(cmd)
+                    tool_result_str = cmd_res
+                    if broadcast_fn:
+                        await broadcast_fn({
+                            "type": "agent_action",
+                            "data": {
+                                "speaker": "📋 터미널 출력 결과",
+                                "role": "tester",
+                                "message": f"```text\n{cmd_res}\n```"
+                            }
+                        })
+
+                # 4. LIST FILES
+                elif name == "list_files":
+                    p = args.get("path") or args.get("file_path") or args.get("filePath") or args.get("target_file") or context_file or ""
+                    tool_result_str = self.tool_list_files(p)
+
+                # Append tool result to messages and session memory
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": tool_result_str
+                }
+                messages.append(tool_msg)
+                self.memory.add_tool_result(tc_id, name, tool_result_str)
+
+        # If no explicit summary was given, request a concise final briefing from DeepSeek
+        if not final_answer or final_answer == "요청하신 작업을 성공적으로 완결하였습니다.":
+            try:
+                summary_prompt = messages + [{
+                    "role": "user",
+                    "content": (
+                        "지금까지 도구들을 통해 실제로 코드를 수정하고 터미널에서 검증한 결과를 바탕으로, "
+                        "대표님께 무엇을 왜 어떻게 고쳤는지 3대 핵심 요약 보고서를 작성하십시오."
+                    )
+                }]
+                briefing = await self.llm.call_llm(
+                    summary_prompt,
+                    model=self.llm.model_chat,
+                    temperature=0.2
+                )
+                if briefing:
+                    final_answer = briefing
+                    self.memory.add_assistant_message(final_answer)
+                    if broadcast_fn:
+                        await broadcast_fn({
+                            "type": "agent_action",
+                            "data": {
+                                "speaker": "📊 DeepSeek 최종 작업 보고",
+                                "role": "assistant",
+                                "message": final_answer
+                            }
+                        })
+            except Exception:
+                pass
+
+        return final_answer or "모든 코드 수정 및 터미널 검증 작업이 완결되었습니다."
+
+    # =====================================================================
+    # 메인 진입점 2: run_autonomous_turn (server.py ws_agent_handler 호환)
+    # =====================================================================
+    async def run_autonomous_turn(
+        self,
+        prompt: str,
+        context_file: str = "",
+        target_file: str = "",
+        broadcast_fn: Optional[Callable] = None
+    ):
+        """
+        server.py 의 ws_agent_handler 가 사용하는 비동기 제너레이터 진입점.
+        [2] context_file / target_file 이 주어지면 active_project 즉시 rebind.
+        이벤트를 dict 형태로 yield 하여 WebSocket 으로 그대로 전송 가능.
+        """
+        ctx = (context_file or target_file or "").strip()
+
+        # [2] 진입 즉시 프로젝트 rebind
+        self._rebind_project_for_context(ctx)
+
+        # [안전 쓰기 파이프라인] 현재 컨텍스트 파일 등록
+        # → write_file 도구가 디렉터리 경로를 받았을 때 자동 전환 대상으로 사용
+        self._current_context_file = ctx
+
+        # [방법 1][Turn 0 선제적 전수 독해] 시작 즉시 파일 전체를 눈앞에 주입
+        preloaded_code = self._preload_context_file(ctx)
+
+        inventory = self._build_context_inventory()
+        system_prompt = self._build_system_prompt(ctx, inventory, preloaded_code)
+
+        self.memory.add_user_message(prompt)
+        messages = self.memory.get_messages_for_llm(system_prompt)
+
+        final_answer = ""
+        for turn in range(6):
+            ai_resp = await self.llm.call_llm_with_tools(
+                messages=messages,
+                tools=NATIVE_TOOLS_SCHEMA,
+                model=self.llm.model_chat,
+                temperature=0.2
+            )
+
+            content = ai_resp.get("content") or ""
+            tool_calls = ai_resp.get("tool_calls") or []
+
+            if content:
+                yield {
+                    "type": "agent_action",
+                    "data": {
+                        "speaker": "🤖 DeepSeek Agent",
+                        "role": "assistant",
+                        "message": content
+                    }
+                }
+                if broadcast_fn:
+                    await broadcast_fn({
+                        "type": "agent_action",
+                        "data": {
+                            "speaker": "🤖 DeepSeek Agent",
+                            "role": "assistant",
+                            "message": content
+                        }
+                    })
+
+            if not tool_calls:
+                final_answer = content or "요청하신 작업을 성공적으로 완결하였습니다."
+                self.memory.add_assistant_message(final_answer)
+                yield {
+                    "type": "agent_final",
+                    "data": {"message": final_answer}
+                }
+                return
+
+            assistant_msg = {"role": "assistant", "content": content}
+            assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+            self.memory.add_assistant_message(content, tool_calls)
+
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name")
+                raw_args = func.get("arguments", "{}")
+                tc_id = tc.get("id", f"call_{turn}")
+
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+
+                tool_result_str = ""
+
+                # [안전 쓰기 파이프라인] 인자 정규화 — 모델이 어떤 키로 보내든 흡수
+                p = (args.get("path") or args.get("file_path") or args.get("filePath")
+                     or args.get("target_file") or args.get("filename")
+                     or context_file or target_file or "")
+                c = (args.get("content") or args.get("code") or args.get("source")
+                     or args.get("new_content") or "")
+
+                # 1. READ FILE
+                if name == "read_file":
+                    res = self.tool_read_file(p)
+                    if res.get("success"):
+                        tool_result_str = (
+                            f"[파일 읽기 성공: {res['filename']} "
+                            f"(총 {res['total_lines']}줄 온전히 독해 완료)]\n{res['full_text']}"
+                        )
+                        yield {
+                            "type": "file_opened",
+                            "data": {
+                                "path": res["path"],
+                                "filename": res["filename"],
+                                "content": res["content"]
+                            }
+                        }
+                    else:
+                        tool_result_str = f"[오류]: {res.get('error')}"
+
+                # 2. WRITE FILE (+ py_compile 즉시 검증)
+                elif name == "write_file":
+                    write_res = self.tool_write_file(p, c)
+                    if write_res.get("success"):
+                        syntax = write_res.get("syntax", {})
+                        tool_result_str = (
+                            f"[파일 수정 완료: {write_res['filename']}] "
+                            f"({write_res['lines']}줄 저장됨)\n"
+                            f"[py_compile 문법 검증]: {syntax.get('message', '검증 미실행')}"
+                        )
+                        yield {
+                            "type": "file_modified",
+                            "data": {
+                                "path": write_res["path"],
+                                "filename": write_res["filename"],
+                                "content": write_res["content"],
+                                "lines": write_res["lines"]
+                            }
+                        }
+                        if syntax.get("checked"):
+                            yield {
+                                "type": "agent_action",
+                                "data": {
+                                    "speaker": "🧪 파이썬 문법 검증 (py_compile)",
+                                    "role": "tester",
+                                    "message": syntax.get("message", "")
+                                }
+                            }
+                    else:
+                        tool_result_str = f"[저장 실패]: {p} — {write_res.get('error', '')}"
+
+                # 3. RUN COMMAND
+                elif name == "run_command":
+                    cmd = args.get("cmd", "")
+                    yield {
+                        "type": "agent_action",
+                        "data": {
+                            "speaker": "⚡ DeepSeek [터미널 실제 구동]",
+                            "role": "deployer",
+                            "message": f"터미널 실행 중: `{cmd}`"
+                        }
+                    }
+                    cmd_res = await self.tool_run_command(cmd)
+                    tool_result_str = cmd_res
+                    yield {
+                        "type": "agent_action",
+                        "data": {
+                            "speaker": "📋 터미널 출력 결과",
+                            "role": "tester",
+                            "message": f"```text\n{cmd_res}\n```"
+                        }
+                    }
+
+                # 4. LIST FILES
+                elif name == "list_files":
+                    tool_result_str = self.tool_list_files(p)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": tool_result_str
+                })
+                self.memory.add_tool_result(tc_id, name, tool_result_str)
+
+        # 루프 소진 시 최종 브리핑
+        if not final_answer:
+            try:
+                summary_prompt = messages + [{
+                    "role": "user",
+                    "content": (
+                        "지금까지 도구들을 통해 실제로 코드를 수정하고 터미널에서 검증한 결과를 바탕으로, "
+                        "대표님께 무엇을 왜 어떻게 고쳤는지 3대 핵심 요약 보고서를 작성하십시오."
+                    )
+                }]
+                briefing = await self.llm.call_llm(
+                    summary_prompt,
+                    model=self.llm.model_chat,
+                    temperature=0.2
+                )
+                if briefing:
+                    final_answer = briefing
+                    self.memory.add_assistant_message(final_answer)
+            except Exception:
+                pass
+
+        yield {
+            "type": "agent_final",
+            "data": {"message": final_answer or "모든 코드 수정 및 터미널 검증 작업이 완결되었습니다."}
+        }

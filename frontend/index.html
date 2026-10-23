@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>DeepSeek-Antigravity IDE</title>
+  <link rel="stylesheet" href="css/antigravity.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+</head>
+<body>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="app-logo">
+        <span class="logo-orb"></span>
+        <span class="logo-text">DeepSeek-Antigravity IDE</span>
+      </div>
+      <div class="workspace-pill">
+        <span class="pill-dot"></span>
+        <span id="activeProjectName">한국 마케팅봇_Sandbox</span>
+      </div>
+    </div>
+    <div class="header-center">
+      <span class="mode-badge triad-badge">⚡ 5대 협업 체제 (DeepSeek Triad + QA + Git)</span>
+      <span class="model-badge">DeepSeek-V3 / R1 (8192 토큰)</span>
+    </div>
+    <div class="header-right">
+      <button class="btn-clean" id="btnOpenRules" title="안티그래피티 무인화 절대 수칙 보기">📜 절대 수칙</button>
+      <button class="btn-clean" id="btnResetSession" title="기억 컨텍스트 롤링 초기화">🧹 새 대화</button>
+      <button class="btn-action" id="btnRunSyntax" title="현재 파일 py_compile 문법 전수 검증">🛡️ py_compile 검증</button>
+      <button class="btn-save" id="btnSaveFile" title="파일 저장 (Ctrl+S)">💾 저장</button>
+    </div>
+  </header>
+
+  <!-- Main 3-Pane Body -->
+  <div class="app-body">
+    <!-- Left Pane: File Explorer -->
+    <aside class="pane pane-explorer" id="paneExplorer">
+      <div class="pane-header">
+        <span class="pane-title">📁 탐색기</span>
+        <button class="icon-btn" id="btnRefreshTree" title="새로고침">🔄</button>
+      </div>
+      <div class="explorer-tree" id="explorerTree">
+        <div class="tree-loading">파일 목록 로딩 중...</div>
+      </div>
+    </aside>
+
+    <div class="resizer" id="resizerLeft"></div>
+
+    <!-- Center Pane: Editor + Terminal -->
+    <main class="pane pane-center" id="paneCenter">
+      <div class="editor-tabs" id="editorTabs">
+        <div class="tab active" id="currentFileTab">
+          <span class="tab-icon">🐍</span>
+          <span class="tab-title" id="tabFileName">run_stock.py</span>
+          <span class="tab-dirty" id="tabDirtyMarker"></span>
+        </div>
+        <div class="tab-controls">
+          <button class="tab-btn" id="btnToggleDiff" title="실시간 Diff 뷰어 토글">⚖️ Diff 비교</button>
+        </div>
+      </div>
+
+      <div class="editor-viewport" id="editorViewport">
+        <!-- Normal Monaco Editor -->
+        <div id="monacoEditorContainer"></div>
+        
+        <!-- Monaco Diff Editor with Floating Action Bar (Block 2) -->
+        <div id="monacoDiffContainer" style="display: none;">
+          <div id="diffActionBar" class="diff-action-bar">
+            <div class="diff-info">
+              <span class="diff-badge">⚡ 딥시크 수정안 대조</span>
+              <span id="diffFilePath" class="diff-file-tag">run_stock.py</span>
+              <span id="diffStats" class="diff-stats">대조 중...</span>
+            </div>
+            <div class="diff-actions">
+              <button id="btnAcceptDiff" class="btn-diff-accept" title="수정안 승인 및 파일 덮어쓰기 (Alt+Enter)">✅ 코드 승인 및 적용 (Alt+Enter)</button>
+              <button id="btnRejectDiff" class="btn-diff-reject" title="수정안 거절 및 원본 유지 (Esc)">❌ 변경 취소 (Esc)</button>
+              <button id="btnToggleInlineDiff" class="btn-diff-view" title="인라인 / 좌우 분할 전환">🔄 좌우/인라인 전환</button>
+            </div>
+          </div>
+          <div id="monacoDiffEditorElement" style="width: 100%; height: calc(100% - 38px);"></div>
+        </div>
+      </div>
+
+      <div class="resizer-h" id="resizerBottom"></div>
+
+      <!-- Bottom Pane: Integrated Terminal -->
+      <section class="pane-terminal" id="paneTerminal">
+        <div class="terminal-header">
+          <span class="terminal-title">🖥️ 통합 무인 콘솔 / 실행 터미널</span>
+          <div class="terminal-actions">
+            <button class="term-btn" id="btnClearTerm">지우기</button>
+            <button class="term-btn-run" id="btnRunTest">▶️ 실행 테스트</button>
+          </div>
+        </div>
+        <div class="terminal-body" id="terminalOutput">
+          <div class="term-line info">[DeepSeek-Antigravity IDE] 5인 AI 무인 협업 체제가 준비되었습니다.</div>
+          <div class="term-line info">백엔드 엔진: 127.0.0.1:8890 연결 대기 중...</div>
+        </div>
+      </section>
+    </main>
+
+    <div class="resizer" id="resizerRight"></div>
+
+    <!-- Right Pane: DeepSeek Triad Collaboration Panel (Block 3) -->
+    <aside class="pane pane-agent" id="paneAgent">
+      <div class="agent-header">
+        <div class="studio-badge-row">
+          <span class="green-pill">5인 AI 협업 체제 가동</span>
+        </div>
+        <h3 class="studio-title">Antigravity DeepSeek Studio</h3>
+        <p class="studio-desc">5인의 딥시크 AI가 상호 비판하고 토론하며, 100% 무인 자동화 마케팅봇을 무결점으로 유지합니다.</p>
+
+        <!-- The 5 Exact Roles Specified by User -->
+        <div class="roles-container">
+          <div class="role-chip role-r1" id="roleR1">
+            <span class="role-bracket bracket-purple"></span>
+            <span class="role-icon">🧠</span>
+            <span class="role-label"><strong>AI 1: DeepSeek-R1</strong> (수석 설계 아키텍트)</span>
+          </div>
+
+          <div class="role-chip role-v3-critic" id="roleV3Critic">
+            <span class="role-bracket bracket-amber"></span>
+            <span class="role-icon">⚔️</span>
+            <span class="role-label"><strong>AI 2: DeepSeek-V3</strong> (비판적 감사 검토관)</span>
+          </div>
+
+          <div class="role-chip role-v3-eng" id="roleV3Eng">
+            <span class="role-bracket bracket-cyan"></span>
+            <span class="role-icon">🛠️</span>
+            <span class="role-label"><strong>AI 3: DeepSeek-V3</strong> (실전 수석 엔지니어)</span>
+          </div>
+
+          <div class="role-chip role-qa" id="roleQA">
+            <span class="role-bracket bracket-green"></span>
+            <span class="role-icon">🧪</span>
+            <span class="role-label"><strong>QA</strong>: 샌드박스 가상 검증관</span>
+          </div>
+
+          <div class="role-chip role-git" id="roleGit">
+            <span class="role-bracket bracket-rose"></span>
+            <span class="role-icon">🚀</span>
+            <span class="role-label"><strong>Git</strong>: 안전 배포 관리관</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agent Live Streaming Chat Log (No Code Vomit) -->
+      <div class="agent-chat-log" id="agentChatLog">
+        <div class="chat-welcome-card">
+          <h4>🚀 5대 AI 협업 체제 준비 완료</h4>
+          <p>수동 조작 없이 <strong>100% 무인 자율 파이프라인</strong>으로 코드를 설계·비판·작성·검증·배포합니다.</p>
+        </div>
+      </div>
+
+      <!-- Agent Prompt Input -->
+      <div class="agent-input-box">
+        <textarea id="promptInput" placeholder="5대 딥시크 협업체에 지시할 작업 또는 오류 증상을 입력하십시오... (Shift+Enter 줄바꿈, Enter 전송)"></textarea>
+        <div class="input-actions">
+          <button class="btn-debate" id="btnStartDebate">⚡ 5대 협업체 전수 가동</button>
+          <button class="btn-send" id="btnSendAgent">🚀 실전 코드 단독 집필</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Absolute Rules Modal (Block 4: Antigravity Rule Editor Block) -->
+  <div id="ruleEditorModal" class="modal-overlay" style="display: none;">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title">📜 안티그래피티 무인화 절대 수칙 (Rule Engine)</div>
+        <button id="btnCloseRules" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">이 수칙들은 모든 딥시크 AI의 System Prompt에 항시 강제 주입되며, 임의 변경이나 무단 우회가 불가능합니다.</p>
+        
+        <div class="rule-item">
+          <div class="rule-item-header">
+            <span class="rule-badge active">강제 적용</span>
+            <strong>1. 🧩 [신규 기능 개발 시 모듈 분리 원칙]</strong>
+          </div>
+          <p class="rule-item-desc">기존 파일에 무리하게 코드를 덧붙이지 않고, 독립된 컴포넌트/유틸리티/서비스 파일로 명확히 분리하여 기존 안정성 훼손을 방지합니다.</p>
+        </div>
+
+        <div class="rule-item">
+          <div class="rule-item-header">
+            <span class="rule-badge active">강제 적용</span>
+            <strong>2. 📢 [사전 원인 분석 및 선(先) 설명 의무] (코드 덤프 금지)</strong>
+          </div>
+          <p class="rule-item-desc">대화창에 무의미하게 코드를 내뱉지 않으며, 반드시 근본 원인을 먼저 한국어로 설명하고 [3줄 핵심 브리핑]만 대화창에 말합니다. 코드는 디프 에디터로 격리 전송됩니다.</p>
+        </div>
+
+        <div class="rule-item">
+          <div class="rule-item-header">
+            <span class="rule-badge active">강제 적용</span>
+            <strong>3. 🔍 [코드 전수 조사 및 신중한 답변 원칙]</strong>
+          </div>
+          <p class="rule-item-desc">겉핥기식 추측을 일절 금지하며, 전체 소스 파일과 라인을 처음부터 끝까지 정밀하게 전수 조사한 후 정확하게 답변합니다.</p>
+        </div>
+
+        <div class="rule-item">
+          <div class="rule-item-header">
+            <span class="rule-badge active">강제 적용</span>
+            <strong>4. 🚫 [무단/암묵적 수정 및 깃 저장 절대 금지]</strong>
+          </div>
+          <p class="rule-item-desc">사용자의 명시적 허락 없이 git commit 및 git push를 실행하지 않으며, 모든 변경 사항은 인라인 Diff로 사전 보고하여 승인을 받습니다.</p>
+        </div>
+
+        <div class="rule-item">
+          <div class="rule-item-header">
+            <span class="rule-badge active">강제 적용</span>
+            <strong>5. 🛑 [표면적 후처리 땜질 및 눈가림식 코딩 전면 금지]</strong>
+          </div>
+          <p class="rule-item-desc">문자열 치환이나 단순 try-except pass 등 임시 땜질을 배제하고, 데이터 파이프라인의 시작점부터 근본적으로 견고하게 설계합니다.</p>
+        </div>
+
+        <div class="rule-item">
+          <div class="rule-item-header">
+            <span class="rule-badge active">강제 적용</span>
+            <strong>6. 🤖 [100% 완전 무인 자동화 봇 원칙]</strong>
+          </div>
+          <p class="rule-item-desc">사람의 수동 개입 없이 24시간 365일 실시간 수집부터 4대 SNS 자율 송출까지 무결하게 자율 가동되는 완전 무인 마케팅봇 구조를 절대 원칙으로 합니다.</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnSaveRules" class="btn-modal-primary">수칙 확인 완료</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
