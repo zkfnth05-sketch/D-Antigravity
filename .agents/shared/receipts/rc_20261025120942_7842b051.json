@@ -1,0 +1,53 @@
+{
+  "verdict": "FAIL",
+  "tag": "council_debate",
+  "path": "C:\\Users\\zkfnt\\Desktop\\aider-main\\.agents\\scripts\\council_enforcer.py",
+  "before": {
+    "exists": true,
+    "hash": "abb0e791e8534a8c6a99d17a5382d1ef22223bc85b5d1325ad4a06dea48b0ec2",
+    "size": 17130
+  },
+  "after": {
+    "exists": true,
+    "hash": "bc93de4dd0e55454665ddfc164f199bd4e684d5743d26c620436d2a51a20d9d7",
+    "size": 22936
+  },
+  "requested_symbols": [
+    "decide_stop",
+    "_check_pass_receipt"
+  ],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": true,
+      "detail": "22936B / 583줄"
+    },
+    {
+      "name": "content_changed",
+      "ok": true,
+      "detail": "변경됨 17130B -> 22936B"
+    },
+    {
+      "name": "syntax",
+      "ok": true,
+      "detail": "compile 통과"
+    },
+    {
+      "name": "no_truncation",
+      "ok": true,
+      "detail": "크기 비율 134%"
+    },
+    {
+      "name": "symbol:decide_stop",
+      "ok": true,
+      "detail": "본문 변경 확인"
+    },
+    {
+      "name": "symbol:_check_pass_receipt",
+      "ok": false,
+      "detail": "수정 후 파일에서 심볼을 찾을 수 없음"
+    }
+  ],
+  "receipt_id": "rc_20261025120942_7842b051",
+  "created_at": "2026-10-25T12:09:42"
+}

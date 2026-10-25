@@ -71,6 +71,22 @@ NATIVE_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "apply_search_replace",
+            "description": "대용량 파일에서 고장 난 부분만 정밀 치환합니다. search 는 원본에 실제로 존재하는 코드를 한 글자도 다르지 않게 복사해야 합니다. 100줄 이상 기존 파일은 write_file 대신 반드시 이 도구를 사용하십시오.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "수정할 파일 경로"},
+                    "search": {"type": "string", "description": "원본에서 찾을 코드 (원문 그대로)"},
+                    "replace": {"type": "string", "description": "대체할 최종 코드"}
+                },
+                "required": ["path", "search", "replace"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": "터미널 명령어나 파이썬 스크립트(pytest, python xxx.py 등)를 프로젝트 디렉터리에서 실제로 구동하고 결과를 확인합니다.",
             "parameters": {
@@ -384,8 +400,8 @@ class AgentExecutor:
         if res.get("success"):
             content = res.get("content", "")
             lines = content.splitlines()
-            # 절대로 중간에 자르지 않고 최대 10만 자까지 온전히 제공
-            safe_content = content[:100000]
+            # 절대로 중간에 자르지 않고 전체를 온전히 제공 (길이 상한 없음)
+            safe_content = content
             return {
                 "success": True,
                 "path": full_path,
@@ -488,6 +504,49 @@ class AgentExecutor:
             "content": content,
             "syntax": syntax
         }
+
+    # =====================================================================
+    # Tool: apply_search_replace (대용량 파일 국소 정밀 치환 + py_compile)
+    # =====================================================================
+    def tool_apply_search_replace(self, path: str, search: str, replace: str) -> Dict[str, Any]:
+        raw_path = (path or "").strip().strip("\"'`").strip()
+        full_path = self._resolve_path(raw_path)
+        filename = os.path.basename(full_path)
+
+        if not search or not search.strip():
+            return {"success": False, "path": full_path, "filename": filename,
+                    "error": "search 구간이 비어 있습니다."}
+
+        patch_text = (
+            "<<<<<<< SEARCH\n" + search.strip("\n") + "\n=======\n"
+            + (replace or "").strip("\n") + "\n>>>>>>> REPLACE"
+        )
+        res = self.pm.apply_search_replace(full_path, patch_text)
+        if not res.get("saved") or res.get("applied", 0) < 1:
+            return {"success": False, "path": full_path, "filename": filename,
+                    "error": res.get("message") or "정밀 치환 실패",
+                    "failed": res.get("failed", [])}
+
+        syntax = self._verify_python_syntax(full_path)
+        read_res = self.tool_read_file(full_path)
+        content = read_res.get("content", "") if read_res.get("success") else ""
+        lines = len(content.splitlines())
+
+        if syntax.get("checked"):
+            if syntax.get("valid"):
+                summary = "DeepSeek 에이전트 SEARCH/REPLACE 정밀 치환 완료 · py_compile 문법 검증 통과"
+            else:
+                summary = ("DeepSeek 에이전트 SEARCH/REPLACE 정밀 치환 완료 · "
+                           "⚠️ py_compile 문법 오류: %s" % syntax.get("error", "")[:200])
+        else:
+            summary = "DeepSeek 에이전트 SEARCH/REPLACE 정밀 치환 완료"
+        try:
+            self.memory.record_file_modification(filename, full_path, lines, summary)
+        except Exception:
+            pass
+
+        return {"success": True, "path": full_path, "filename": filename,
+                "lines": lines, "content": content, "syntax": syntax}
 
     # =====================================================================
     # Tool: run_command
@@ -642,10 +701,9 @@ class AgentExecutor:
   >>>>>>> REPLACE
 - 위 형식이 감지되면 시스템이 apply_search_replace 로 국소 정밀 치환을 자동 수행합니다.
 
-🚨 [핵심 행동 원칙 - 완성형 코드 블록 필수 출력 (시스템 디스크 자동 저장 연동)]:
-- 코드를 작성하거나 수정할 때는 반드시 파일 전체 코드를 온전한 파이썬 코드 블록(```python ... ```)으로 출력하십시오!
-- 출력된 최신 코드 블록은 MCP 서버의 디스크 강제 동기화 게이트가 자동으로 가로채 대상 파일에 100% 원자적으로 안전하게 저장합니다.
-- 절대로 중간 생략(...)이나 설명으로 때우지 말고 1줄부터 끝줄까지 100% 동작하는 완성 코드를 블록 내에 온전히 작성하십시오.
+🚨 [핵심 행동 원칙 - 파일 크기별 수정 방식 (시스템 디스크 자동 저장 연동)]:
+- 100줄 이상 기존 파일: 전체 코드 블록 출력이나 write_file 전체 덮어쓰기는 시스템이 물리적으로 차단합니다. 반드시 apply_search_replace 도구(또는 SEARCH/REPLACE 블록)로 고장 난 부분만 정밀 치환하십시오.
+- 100줄 미만 파일 또는 신규 파일: 전체 코드를 온전한 코드 블록으로 출력하거나 write_file 로 저장해도 됩니다. 중간 생략(...)은 금지입니다.
 - 파일을 수정한 후에는 반드시 `run_command`로 `python -m py_compile [파일명]` 또는 테스트를 실행하여 문법 오류가 없는지 직접 검증하십시오!
 
 1. [되묻기 및 지시대기 전면 금지]:
@@ -857,6 +915,29 @@ class AgentExecutor:
                                 })
                     else:
                         tool_result_str = f"[저장 실패]: {p} — {write_res.get('error', '')}"
+
+                # 2-1. APPLY SEARCH/REPLACE (대용량 파일 국소 정밀 치환)
+                elif name == "apply_search_replace":
+                    p = args.get("path") or args.get("file_path") or args.get("filePath") or args.get("target_file") or context_file or ""
+                    sr_res = self.tool_apply_search_replace(p, args.get("search", ""), args.get("replace", ""))
+                    if sr_res.get("success"):
+                        syntax = sr_res.get("syntax", {})
+                        tool_result_str = (
+                            f"[정밀 치환 완료: {sr_res['filename']}] ({sr_res['lines']}줄 유지)\n"
+                            f"[py_compile 문법 검증]: {syntax.get('message', '검증 미실행')}"
+                        )
+                        if broadcast_fn:
+                            await broadcast_fn({
+                                "type": "file_modified",
+                                "data": {
+                                    "path": sr_res["path"],
+                                    "filename": sr_res["filename"],
+                                    "content": sr_res["content"],
+                                    "lines": sr_res["lines"]
+                                }
+                            })
+                    else:
+                        tool_result_str = f"[정밀 치환 실패]: {p} — {sr_res.get('error', '')}"
 
                 # 3. RUN COMMAND
                 elif name == "run_command":
@@ -1075,6 +1156,27 @@ class AgentExecutor:
                             }
                     else:
                         tool_result_str = f"[저장 실패]: {p} — {write_res.get('error', '')}"
+
+                # 2-1. APPLY SEARCH/REPLACE (대용량 파일 국소 정밀 치환)
+                elif name == "apply_search_replace":
+                    sr_res = self.tool_apply_search_replace(p, args.get("search", ""), args.get("replace", ""))
+                    if sr_res.get("success"):
+                        syntax = sr_res.get("syntax", {})
+                        tool_result_str = (
+                            f"[정밀 치환 완료: {sr_res['filename']}] ({sr_res['lines']}줄 유지)\n"
+                            f"[py_compile 문법 검증]: {syntax.get('message', '검증 미실행')}"
+                        )
+                        yield {
+                            "type": "file_modified",
+                            "data": {
+                                "path": sr_res["path"],
+                                "filename": sr_res["filename"],
+                                "content": sr_res["content"],
+                                "lines": sr_res["lines"]
+                            }
+                        }
+                    else:
+                        tool_result_str = f"[정밀 치환 실패]: {p} — {sr_res.get('error', '')}"
 
                 # 3. RUN COMMAND
                 elif name == "run_command":

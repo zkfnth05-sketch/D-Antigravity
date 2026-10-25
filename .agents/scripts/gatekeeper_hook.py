@@ -129,6 +129,83 @@ _WRITE_KEYWORDS = (
     "shell", "bash", "patch", "commit", "push", "apply", "install", "kill",
 )
 
+# ------------------------------------------------------------
+# 항상 허용 도구 — call_mcp_tool / 딥시크 도구 계열 (상시 allowlist)
+# 이 도구들은 Antigravity IDE가 딥시크 에이전트를 호출할 때
+# 거쳐야 하는 MCP 브릿지이므로 차단하면 데드락이 발생한다.
+# ------------------------------------------------------------
+ALWAYS_ALLOW_TOOLS = {
+    # MCP 브릿지
+    "call_mcp_tool",
+    "invoke_mcp",
+    "mcp_tool",
+    # 딥시크 콕실 5인 협업체 도구 (전체)
+    "deepseek_council_debate",
+    "deepseek_autonomous_codegen",
+    "deepseek_read_file_full",
+    "deepseek_verify_python_syntax",
+    "deepseek_list_projects",
+    "deepseek_switch_project",
+    "deepseek_view_timeline",
+    "deepseek_rollback_file",
+    "deepseek_verify_receipt",
+    "deepseek_search_code",
+    "deepseek_code_outline",
+    "deepseek_view_section",
+    # 서브에이전트 실행
+    "browser_subagent",
+    "generate_image",
+    "schedule",
+    "ask_question",
+    # Antigravity IDE 내장 도구 (제미나이 사용 허용)
+    "search_web",
+    "manage_task",
+}
+
+# ============================================================
+# [Phase 6] 권한 정책 단일 출처 (Single Source of Truth)
+# ============================================================
+# 설계 원칙:
+#   1) 도구 → 카테고리 매핑은 TOOL_POLICY_REGISTRY 하나로 통합.
+#   2) 카테고리 → 정책은 CATEGORY_POLICY_MATRIX 하나로 통합.
+#   3) classify()는 레지스트리 조회만, decide()는 매트릭스 참조만.
+#   4) 키워드 추론은 레지스트리 미등록 도구에 대한 최후 fallback.
+#   5) 판정 불가/예외/타임아웃은 무조건 deny (fail-closed 유지).
+
+# 카테고리 상수
+CAT_ALLOW = "allow"                # 상시 허용 (MCP 브릿지/딥시크 도구)
+CAT_READ = "read"                  # 읽기 전용 (헌장 7-1: 허용)
+CAT_WRITE = "write"                # 쓰기/실행 (토큰 필수)
+CAT_UNKNOWN = "unknown"            # 판정 불가 (deny)
+
+# 정책 상수
+POLICY_ALLOW = "allow"             # 즉시 허용
+POLICY_READ_ONLY_ALLOW = "read_only_allow"  # 읽기 전용 허용 (토큰 검증 우회)
+POLICY_REQUIRE_TOKEN = "require_token"      # 딥시크 5인 서명 토큰 필수
+POLICY_DENY = "deny"               # 즉시 거부
+
+# 카테고리 → 정책 매트릭스 (단일 출처)
+CATEGORY_POLICY_MATRIX: Dict[str, str] = {
+    CAT_ALLOW:   POLICY_ALLOW,
+    CAT_READ:    POLICY_READ_ONLY_ALLOW,   # ★ 읽기 데드락 해소의 핵심
+    CAT_WRITE:   POLICY_REQUIRE_TOKEN,
+    CAT_UNKNOWN: POLICY_DENY,
+}
+
+# 도구 → 카테고리 레지스트리 (단일 출처)
+#   · GUARDED_WRITE_TOOLS / GUARDED_READ_TOOLS / ALWAYS_ALLOW_TOOLS 를
+#     하나의 레지스트리로 통합. 신규 도구 추가 시 이 딕셔너리만 수정.
+TOOL_POLICY_REGISTRY: Dict[str, str] = {}
+for _t in ALWAYS_ALLOW_TOOLS:
+    TOOL_POLICY_REGISTRY[_t] = CAT_ALLOW
+for _t in GUARDED_WRITE_TOOLS:
+    TOOL_POLICY_REGISTRY[_t] = CAT_WRITE
+for _t in GUARDED_READ_TOOLS:
+    TOOL_POLICY_REGISTRY[_t] = CAT_READ
+
+# 하위 호환: 기존 집합 참조 코드가 남아있어도 동작하도록 유지
+# (신규 코드는 TOOL_POLICY_REGISTRY / CATEGORY_POLICY_MATRIX 사용)
+
 # 딥시크 5인 협업체 식별자 (거버넌스 문서와 1:1 대응)
 DEEPSEEK_COLLABORATORS = [
     "ds_r1_architect",      # AI 1 — 수석설계 아키텍트
@@ -385,20 +462,30 @@ class Gatekeeper:
 
     @classmethod
     def classify(cls, raw_tool: str) -> str:
-        """도구 분류: 'write' | 'read' | 'other'."""
+        """
+        도구 분류 — TOOL_POLICY_REGISTRY 단일 출처 조회.
+
+        반환: CAT_ALLOW | CAT_READ | CAT_WRITE | CAT_UNKNOWN
+        키워드 추론은 레지스트리 미등록 도구에 대한 최후 fallback.
+        """
         name = cls.normalize_tool_name(raw_tool)
         if not name:
-            return "other"
-        if name in GUARDED_WRITE_TOOLS:
-            return "write"
-        if name in GUARDED_READ_TOOLS:
-            return "read"
-        # 정확 매칭 실패 시 키워드 기반 보수적 분류 (fail-closed 지향)
+            return CAT_UNKNOWN
+
+        # 1) 레지스트리 정확 매칭 (단일 출처)
+        if name in TOOL_POLICY_REGISTRY:
+            return TOOL_POLICY_REGISTRY[name]
+
+        # 2) 딥시크_* 프리픽스 실질 컴형 (레지스트리 누락 대비 안전망)
+        if name.startswith("deepseek"):
+            return CAT_ALLOW
+
+        # 3) 최후 fallback — 키워드 기반 보수적 분류 (fail-closed 지향)
         if any(k in name for k in _WRITE_KEYWORDS):
-            return "write"
+            return CAT_WRITE
         if any(k in name for k in _READ_KEYWORDS):
-            return "read"
-        return "unknown"
+            return CAT_READ
+        return CAT_UNKNOWN
 
     @staticmethod
     def extract(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
@@ -450,21 +537,56 @@ class Gatekeeper:
     @classmethod
     def decide(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
-        PreToolUse 판정 — Antigravity 표준 스키마 반환.
+        PreToolUse 판정 — CATEGORY_POLICY_MATRIX 단일 출처 참조.
 
-        반환:
-          - 차단: {"decision": "deny",  "reason": DENY_REASON}
-          - 허용: {"decision": "allow", "reason": "OK"}
+        정책 분기:
+          - POLICY_ALLOW            → 즉시 allow (MCP 브릿지/딥시크 도구)
+          - POLICY_READ_ONLY_ALLOW  → 즉시 allow (읽기 전용, 토큰 검증 우회)
+          - POLICY_REQUIRE_TOKEN    → 딥시크 5인 서명 토큰 검증 후 allow
+          - POLICY_DENY             → 즉시 deny (unknown/누락)
+
+        fail-closed 원칙: 예외/타임아웃/판정 불가는 "정지"가 아닌 "거부".
         """
         tool, args, token_id = cls.extract(payload)
         category = cls.classify(tool)
+        policy = CATEGORY_POLICY_MATRIX.get(category, POLICY_DENY)
 
-        # fail-closed: 도구명 누락 또는 unknown 카테고리는 즉시 deny
-        if not tool or category == "unknown":
-            AuditLog.write({"event": "gatekeeper_deny_unknown", "tool": tool, "payload": payload})
+        # [정책 1] 상시 허용 (MCP 브릿지 / 딥시크 도구)
+        if policy == POLICY_ALLOW:
+            AuditLog.write({
+                "event": "gatekeeper_allow",
+                "tool": tool,
+                "category": category,
+                "policy": policy,
+                "rule": "matrix.allow",
+            })
+            return {"decision": "allow", "reason": ALLOW_REASON}
+
+        # [정책 2] 읽기 전용 허용 (헌장 7-1) — 토큰 검증 경로 우회
+        #   ★ 쓰기 검증 로직을 재사용하지 않음으로써 읽기 데드락 원천 차단
+        if policy == POLICY_READ_ONLY_ALLOW:
+            AuditLog.write({
+                "event": "gatekeeper_allow_read",
+                "tool": tool,
+                "category": category,
+                "policy": policy,
+                "rule": "matrix.read_only_allow",
+            })
+            return {"decision": "allow", "reason": ALLOW_REASON}
+
+        # [정책 3] 판정 불가/도구명 누락 → 즉시 deny (fail-closed)
+        if policy == POLICY_DENY or not tool:
+            AuditLog.write({
+                "event": "gatekeeper_deny_unknown",
+                "tool": tool,
+                "category": category,
+                "policy": policy,
+                "rule": "matrix.deny",
+            })
             return {"decision": "deny", "reason": DENY_REASON}
 
-        # fail-closed: 예외 발생 시 무조건 deny
+        # [정책 4] 쓰기/실행 → 딥시크 5인 서명 토큰 필수
+        #   예외 발생 시에도 "정지"가 아닌 "거부"로 귀결 (fail-closed)
         try:
             ok, reason = TokenIssuer.verify(token_id, tool, args)
         except Exception as e:
@@ -479,16 +601,16 @@ class Gatekeeper:
             "event": "gatekeeper_decision",
             "tool": tool,
             "category": category,
+            "policy": policy,
+            "rule": "matrix.require_token",
             "token_id": token_id,
             "fingerprint": fp,
             "decision": "allow" if ok else "deny",
             "reason": reason,
         })
 
-        # 딥시크 5인 서명 토큰이 유효한 경우에만 allow
         if ok:
             return {"decision": "allow", "reason": ALLOW_REASON}
-
         return {"decision": "deny", "reason": DENY_REASON}
 
 
@@ -676,6 +798,13 @@ class Watchdog:
 # 6. 훅 실행기 (타임아웃 + 데드락 방지 + fail-closed)
 # ============================================================
 def _run_with_timeout(fn, timeout_sec: int) -> Dict[str, Any]:
+    """
+    블로킹 호출 상한 집행 — 24h 무인 가동 안전장치.
+
+    · 타임아웃 시 즉시 deny 반환 (정지 아님, 거부).
+    · 데몬 스레드는 프로세스 종료 시 자동 회수 (좀비 방지).
+    · 예외 발생 시에도 deny (fail-closed).
+    """
     result: Dict[str, Any] = {}
 
     def _target():
@@ -684,13 +813,23 @@ def _run_with_timeout(fn, timeout_sec: int) -> Dict[str, Any]:
         except Exception as e:
             result["error"] = e
 
-    t = threading.Thread(target=_target, daemon=True)
+    t = threading.Thread(target=_target, daemon=True, name="gatekeeper-hook")
     t.start()
     t.join(timeout_sec)
     if t.is_alive():
         # 데드락 방지: 데몬 스레드는 프로세스 종료 시 자동 회수
+        AuditLog.write({
+            "event": "hook_timeout",
+            "timeout_sec": timeout_sec,
+            "rule": "fail_closed.timeout_deny",
+        })
         return {"decision": "deny", "reason": DENY_REASON}
     if "error" in result:
+        AuditLog.write({
+            "event": "hook_exception",
+            "error": str(result["error"]),
+            "rule": "fail_closed.exception_deny",
+        })
         return {"decision": "deny", "reason": DENY_REASON}
     return result.get("value", {"decision": "deny", "reason": DENY_REASON})
 

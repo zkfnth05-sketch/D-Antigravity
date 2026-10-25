@@ -1,0 +1,35 @@
+{
+  "verdict": "PARTIAL",
+  "tag": "autonomous_codegen",
+  "path": "C:\\Users\\zkfnt\\Desktop\\aider-main\\deploy_targets.json",
+  "before": {
+    "exists": true,
+    "hash": "35b8266f675187e3021e7b1e29867a46a8ab8aec2e0916e7279dc33b654bb7c2",
+    "size": 2239
+  },
+  "after": {
+    "exists": true,
+    "hash": "677cd248cd638da72a7e0d2afd9cc24015332a1fee63d76a9218cb6d38e2d15c",
+    "size": 317
+  },
+  "requested_symbols": [],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": true,
+      "detail": "317B / 10줄"
+    },
+    {
+      "name": "content_changed",
+      "ok": true,
+      "detail": "변경됨 2239B -> 317B"
+    },
+    {
+      "name": "no_truncation",
+      "ok": false,
+      "detail": "크기가 14% 로 급감 — 덮어쓰기/잘림 사고 의심"
+    }
+  ],
+  "receipt_id": "rc_20261025121921_8b9ef342",
+  "created_at": "2026-10-25T12:19:21"
+}

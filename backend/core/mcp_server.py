@@ -45,6 +45,13 @@ from core.deepseek_client import DeepSeekClient
 from core.project_manager import ProjectManager
 from core.council_debate import CouncilDebateEngine
 from core.agent_executor import AgentExecutor
+from core.conversation_context import build_task_with_context
+from core.code_tools.search_code import search_code, format_search_result
+from core.code_tools.code_eye import CodeEye
+from core import completion_gate
+from core import work_order
+
+_code_eye = CodeEye()
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "deepseek-council-studio"
@@ -367,7 +374,20 @@ class DeepSeekMcpServer:
                         },
                         "code_snippet": {
                             "type": "string",
-                            "description": "특정 검토 대상 코드 조각 (생략 시 target_file을 자동 전수 독해함)"
+                            "description": "특정 검토 대상 코드 조각 (지정하면 범위 지정 없이도 허용됨)"
+                        },
+                        "target_symbol": {
+                            "type": "string",
+                            "description": "수정할 함수/클래스/메서드 이름. 쉼표로 여러 개 가능 (예: \"Foo.bar, helper\"). 기존 파일 수정 시 target_symbol / line_range / whole_file 중 하나 필수."
+                        },
+                        "line_range": {
+                            "type": "string",
+                            "description": "수정할 줄 범위 \"시작-끝\" (예: \"120-180\")"
+                        },
+                        "whole_file": {
+                            "type": "boolean",
+                            "description": "파일 전체가 대상임을 명시 (비권장)",
+                            "default": False
                         }
                     },
                     "required": ["task"]
@@ -386,6 +406,19 @@ class DeepSeekMcpServer:
                         "file_path": {
                             "type": "string",
                             "description": "수정 또는 생성할 파일 경로"
+                        },
+                        "target_symbol": {
+                            "type": "string",
+                            "description": "수정할 함수/클래스/메서드 이름. 쉼표로 여러 개 가능 (예: \"Foo.bar, helper\"). 기존 파일 수정 시 target_symbol / line_range / whole_file 중 하나 필수."
+                        },
+                        "line_range": {
+                            "type": "string",
+                            "description": "수정할 줄 범위 \"시작-끝\" (예: \"120-180\")"
+                        },
+                        "whole_file": {
+                            "type": "boolean",
+                            "description": "파일 전체가 대상임을 명시 (비권장)",
+                            "default": False
                         }
                     },
                     "required": ["instructions"]
@@ -462,6 +495,34 @@ class DeepSeekMcpServer:
                 }
             },
             {
+                "name": "deepseek_verify_receipt",
+                "description": "딥시크 도구가 반환한 완료검증 영수증(receipt_id)을 현재 디스크 상태와 독립 재대조합니다. 제미나이는 '수정 완료' 보고 전에 반드시 이 도구로 MATCH 확인을 받아야 합니다.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "receipt_id": {"type": "string", "description": "응답 첫 줄의 receipt=... 값 (예: rc_20261025113000_ab12cd34)"}
+                    },
+                    "required": ["receipt_id"]
+                }
+            },
+            {
+                "name": "deepseek_search_code",
+                "description": "활성 프로젝트 전체 파일을 절단 없이 전수 검색하여 파일:라인 단위 매칭 결과를 반환합니다(정규식/대소문자/확장자/컨텍스트 지원).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "검색어 또는 정규식"},
+                        "is_regex": {"type": "boolean", "default": False},
+                        "case_sensitive": {"type": "boolean", "default": False},
+                        "extension": {"type": "string", "description": "확장자 필터 (예: py)"},
+                        "context_lines": {"type": "integer", "default": 0, "description": "전후 문맥 줄 수 (최대 10)"},
+                        "max_results": {"type": "integer", "default": 200},
+                        "project_path": {"type": "string", "description": "검색 루트 (생략 시 활성 프로젝트)"}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
                 "name": "deepseek_rollback_file",
                 "description": "지정한 특정 시간대(target_time) 또는 특정 스냅샷(snapshot_id) 또는 직전 상태(previous)로 파일을 1초 만에 안전하게 롤백합니다. 롤백 직전 상태도 자동 보존되어 '롤백의 롤백'이 가능합니다.",
                 "inputSchema": {
@@ -483,6 +544,42 @@ class DeepSeekMcpServer:
                             "type": "boolean",
                             "description": "True 이면 직전 스냅샷 상태로 복원합니다.",
                             "default": False
+                        }
+                    },
+                    "required": ["file_path"]
+                }
+            },
+            {
+                "name": "deepseek_code_outline",
+                "description": "대상 소스코드 파일의 전체 구조 개요(클래스/함수/메서드/상수 심볼 테이블)를 100K 절단 없이 반환합니다. 파일 전체를 읽기 전 구조 파악에 사용하십시오.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "개요를 볼 파일 경로 (절대/상대 경로)"
+                        }
+                    },
+                    "required": ["file_path"]
+                }
+            },
+            {
+                "name": "deepseek_view_section",
+                "description": "소스코드 파일에서 특정 함수/클래스/메서드 구간만 정밀 조회합니다. 100K 절단 없이 해당 심볼의 전체 코드를 반환합니다. 수정 전 반드시 이 도구로 원문을 먼저 확인하십시오.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "파일 경로 (절대/상대 경로)"
+                        },
+                        "symbol_name": {
+                            "type": "string",
+                            "description": "조회할 함수/클래스/메서드 이름 (예: MyClass, MyClass.my_method)"
+                        },
+                        "line_range": {
+                            "type": "string",
+                            "description": "직접 줄 범위 지정 (예: 120-180). symbol_name 대신 사용 가능."
                         }
                     },
                     "required": ["file_path"]
@@ -510,11 +607,17 @@ class DeepSeekMcpServer:
         if tool_name == "deepseek_council_debate":
             return await self._tool_council_debate(arg_str("task"),
                                                    arg_str("target_file"),
-                                                   args.get("code_snippet", "") or "")
+                                                   args.get("code_snippet", "") or "",
+                                                   arg_str("target_symbol"),
+                                                   arg_str("line_range"),
+                                                   bool(args.get("whole_file", False)))
 
         elif tool_name == "deepseek_autonomous_codegen":
             return await self._tool_autonomous_codegen(arg_str("instructions"),
-                                                       arg_str("file_path"))
+                                                       arg_str("file_path"),
+                                                       arg_str("target_symbol"),
+                                                       arg_str("line_range"),
+                                                       bool(args.get("whole_file", False)))
 
         elif tool_name == "deepseek_read_file_full":
             return await self._tool_read_file_full(arg_str("file_path"))
@@ -531,6 +634,20 @@ class DeepSeekMcpServer:
         elif tool_name == "deepseek_view_timeline":
             return await self._tool_view_timeline(arg_str("file_path"),
                                                   args.get("limit", 10))
+
+        elif tool_name == "deepseek_verify_receipt":
+            return await self._tool_verify_receipt(arg_str("receipt_id"))
+
+        elif tool_name == "deepseek_search_code":
+            return await self._tool_search_code(args, arg_str)
+
+        elif tool_name == "deepseek_code_outline":
+            return await self._tool_code_outline(arg_str("file_path"))
+
+        elif tool_name == "deepseek_view_section":
+            return await self._tool_view_section(arg_str("file_path"),
+                                                 arg_str("symbol_name"),
+                                                 arg_str("line_range"))
 
         elif tool_name == "deepseek_rollback_file":
             return await self._tool_rollback_file(arg_str("file_path"),
@@ -551,9 +668,21 @@ class DeepSeekMcpServer:
     # ------------------------------------------------------------------
     # 도구 1: 5인 협업체 심의 (+ py_compile 필수 포함)
     # ------------------------------------------------------------------
-    async def _tool_council_debate(self, task: str, target_file: str, code_snippet: str) -> Dict[str, Any]:
+    async def _tool_council_debate(self, task: str, target_file: str, code_snippet: str,
+                                   target_symbol: str = "", line_range: str = "",
+                                   whole_file: bool = False) -> Dict[str, Any]:
         # 2) 진입 즉시 프로젝트 자동 전환
         active = self.bind_project_for(target_file)
+        task = build_task_with_context(task)
+        gate_before = completion_gate.capture_state(self.resolve_path(target_file)) if target_file else None
+
+        # [작업지시서 계약] 기존 파일 수정 요청은 범위 필수 — 서버가 디스크에서 원문을 직접 추출해 주입
+        wo = work_order.build(self.resolve_path(target_file) if target_file else "",
+                              target_symbol, line_range, whole_file, has_snippet=bool(code_snippet))
+        if not wo.ok:
+            return {"content": [{"type": "text", "text": wo.error}], "isError": True}
+        task = task + wo.prompt_block
+        self.log("[WORK_ORDER] council_debate mode=%s symbols=%s file=%s" % (wo.mode, wo.symbols, wo.file))
 
         sections = {
             "architect": "",
@@ -561,7 +690,8 @@ class DeepSeekMcpServer:
             "engineer_briefing": "",
             "qa": "",
             "git": "",
-            "code": ""
+            "code": "",
+            "patch": ""
         }
 
         async for step in self.council.run_debate_session(target_file, task, code_snippet):
@@ -594,12 +724,38 @@ class DeepSeekMcpServer:
                 if stype == "diff_ready":
                     data = step.get("data", {}) or {}
                     sections["code"] = data.get("new_content", "")
+                    sections["patch"] = data.get("patch_text", "")
 
         # ------------------------------------------------------------------
         # [방법 2] sections["code"] + target_file 존재 시 완성 코드를 디스크에 직접 저장
         # ------------------------------------------------------------------
         force_save_banner = ""
-        if sections["code"] and target_file:
+        if sections["patch"] and target_file:
+            full_t = self.resolve_path(target_file)
+            try:
+                asr_res = self.pm.apply_search_replace(full_t, sections["patch"])
+            except Exception as e:
+                asr_res = {"success": False, "applied": 0, "total": 0,
+                           "saved": False, "message": "apply_search_replace 예외: %s" % e}
+
+            if asr_res.get("applied", 0) > 0 and asr_res.get("saved"):
+                self.log("[MCP SEARCH/REPLACE] council_debate 정밀 패치 적용 -> %s (%d/%d 블록)"
+                         % (full_t, asr_res.get("applied", 0), asr_res.get("total", 0)))
+                force_save_banner = (
+                    "\n\n🎯 [SEARCH/REPLACE 정밀 패치 적용]\n"
+                    "`%s` 에 블록 %d/%d 건을 국소 치환하여 저장했습니다. (파일 전체 재작성 없음)"
+                    % (full_t, asr_res.get("applied", 0), asr_res.get("total", 0))
+                )
+            else:
+                self.log("[MCP SEARCH/REPLACE] council_debate 패치 미적용 -> %s (%s)"
+                         % (full_t, asr_res.get("message", "")))
+                force_save_banner = (
+                    "\n\n⚠️ [SEARCH/REPLACE 패치 미적용 - 파일은 변경되지 않았습니다]\n"
+                    "`%s` - %s (적용 %d/%d 블록)"
+                    % (full_t, asr_res.get("message", "알 수 없는 사유"),
+                       asr_res.get("applied", 0), asr_res.get("total", 0))
+                )
+        elif sections["code"] and target_file:
             full_t = self.resolve_path(target_file)
             try:
                 save_res = self.pm.save_file_content(full_t, sections["code"])
@@ -642,6 +798,8 @@ class DeepSeekMcpServer:
             report.append(f"### 🧪 QA: 샌드박스 가상 검증관 (py_compile)\n{sections['qa'].strip()}")
         if sections["git"]:
             report.append(f"### 🚀 Git: 안전 배포 관리관\n{sections['git'].strip()}")
+        if sections["patch"]:
+            report.append("### 🩹 [적용 시도된 SEARCH/REPLACE 패치]\n```\n%s\n```" % sections["patch"])
         if sections["code"]:
             report.append(f"### 💻 [검증 완료된 완성형 코드]\n```python\n{sections['code']}\n```")
 
@@ -652,24 +810,45 @@ class DeepSeekMcpServer:
         if force_save_banner:
             text += force_save_banner
 
-        return {"content": [{"type": "text", "text": text}]}
+        # [완료검증 게이트] 코드/패치가 산출된 수정 요청은 디스크 실측 판정을 응답 맨 앞에 고정
+        is_err = False
+        if gate_before is not None and (sections["patch"] or sections["code"]):
+            gate = completion_gate.evaluate(self.resolve_path(target_file), gate_before,
+                                            wo.symbols, tag="council_debate")
+            text = completion_gate.format_header(gate) + text
+            is_err = completion_gate.is_failure(gate)
+        elif gate_before is not None:
+            text = "⚪ **[완료검증 없음]** 이번 심의에서 코드/패치가 산출되지 않았습니다(분석 전용). 파일은 변경되지 않았습니다.\n\n" + text
+
+        return {"content": [{"type": "text", "text": text}], "isError": is_err}
 
     # ------------------------------------------------------------------
     # 도구 2: 자율 코드 생성 (+ 핫리로드 + 디스크 물리 검증 + py_compile)
     # ------------------------------------------------------------------
-    async def _tool_autonomous_codegen(self, instructions: str, file_path: str) -> Dict[str, Any]:
+    async def _tool_autonomous_codegen(self, instructions: str, file_path: str,
+                                       target_symbol: str = "", line_range: str = "",
+                                       whole_file: bool = False) -> Dict[str, Any]:
         # 0) 핫 리로드 (agent_executor / project_manager 디스크 최신 변경분 즉시 메모리 동기화)
         reload_status = self.hot_reload_core()
 
         # 1) 디스크 기록 전 스냅샷 해시 측정 (거짓 보고 방지)
         full_p = self.resolve_path(file_path) if file_path else ""
         before = sha256_of_file(full_p)
+        gate_before = completion_gate.capture_state(full_p)
         before_hash = before["hash"]
         before_size = before["size"]
 
         # 2) 진입 즉시 프로젝트 자동 전환
         active = self.bind_project_for(file_path)
 
+        instructions = build_task_with_context(instructions)
+
+        # [작업지시서 계약] 기존 파일 수정 요청은 범위 필수 — 서버가 디스크에서 원문을 직접 추출해 주입
+        wo = work_order.build(full_p, target_symbol, line_range, whole_file)
+        if not wo.ok:
+            return {"content": [{"type": "text", "text": wo.error}], "isError": True}
+        instructions = instructions + wo.prompt_block
+        self.log("[WORK_ORDER] autonomous_codegen mode=%s symbols=%s file=%s" % (wo.mode, wo.symbols, wo.file))
         output = await self.executor.execute_user_request(
             user_prompt=instructions,
             context_file=file_path
@@ -835,7 +1014,10 @@ class DeepSeekMcpServer:
                 )
 
         header = f"**🎯 활성 프로젝트**: `{active}`\n**♻️ 핫리로드**: {reload_status}\n\n"
-        return {"content": [{"type": "text", "text": header + (output or "") + force_sync_banner + verify_banner + snapshot_banner + syntax_info}]}
+        gate = completion_gate.evaluate(full_p, gate_before, wo.symbols, tag="autonomous_codegen")
+        gate_header = completion_gate.format_header(gate)
+        return {"content": [{"type": "text", "text": gate_header + header + (output or "") + force_sync_banner + verify_banner + snapshot_banner + syntax_info}],
+                "isError": completion_gate.is_failure(gate)}
 
     # ------------------------------------------------------------------
     # 도구 3: 파일 전수 독해
@@ -851,6 +1033,120 @@ class DeepSeekMcpServer:
                     f"```python\n{res.get('content')}\n```")
         else:
             text = f"❌ 파일 읽기 실패: {res.get('error')}\n\n**🎯 활성 프로젝트**: `{active}`"
+        return {"content": [{"type": "text", "text": text}]}
+
+    # ------------------------------------------------------------------
+    # 도구: 완료검증 영수증 독립 재대조 (core.completion_gate 위임)
+    # ------------------------------------------------------------------
+    async def _tool_verify_receipt(self, receipt_id: str) -> Dict[str, Any]:
+        res = await asyncio.to_thread(completion_gate.verify_receipt, receipt_id)
+        rec = res.get("receipt") or {}
+        icon = "🟢" if res.get("ok") else "🔴"
+        lines = ["%s **[영수증 재검증 %s]** receipt=`%s`" % (icon, res.get("status"), receipt_id),
+                 "- %s" % res.get("detail", "")]
+        if rec:
+            lines.append("- 파일: `%s`" % rec.get("path"))
+            lines.append("- 당시 판정: %s (%s)" % (rec.get("verdict"), rec.get("created_at")))
+            for c in rec.get("checks", []):
+                lines.append("  - %s %s: %s" % ("✅" if c["ok"] else "❌", c["name"], c["detail"]))
+        if res.get("status") == "MATCH" and res.get("ok"):
+            lines.append("\n→ 제미나이는 이 영수증을 근거로 '완료' 보고할 수 있습니다.")
+        else:
+            lines.append("\n→ 확인 실패: '완료'라고 보고하면 안 됩니다. 사실그대로 보고하십시오.")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}], "isError": not res.get("ok")}
+
+    # ------------------------------------------------------------------
+    # 도구: 프로젝트 전수 코드 검색 (code_tools.search_code 위임)
+    # ------------------------------------------------------------------
+    async def _tool_search_code(self, args: Dict[str, Any], arg_str) -> Dict[str, Any]:
+        project_path = arg_str("project_path")
+        root = self.resolve_path(project_path) if project_path else self.pm.active_project
+        try:
+            max_results = int(args.get("max_results", 200) or 200)
+            context_lines = int(args.get("context_lines", 0) or 0)
+        except (TypeError, ValueError):
+            return {"content": [{"type": "text", "text": "❌ max_results/context_lines 는 정수여야 합니다."}], "isError": True}
+        res = await asyncio.to_thread(
+            search_code, root, arg_str("query"),
+            bool(args.get("is_regex", False)), bool(args.get("case_sensitive", False)),
+            arg_str("extension"), max_results, context_lines)
+        text = format_search_result(root, arg_str("query"), res)
+        return {"content": [{"type": "text", "text": text}], "isError": not res.get("success")}
+
+    # ------------------------------------------------------------------
+    # 도구: 파일 구조 개요 (code_tools.code_eye 위임)
+    # ------------------------------------------------------------------
+    async def _tool_code_outline(self, file_path: str) -> Dict[str, Any]:
+        if not file_path:
+            return {"content": [{"type": "text", "text": "❌ file_path 인자가 비어 있습니다."}], "isError": True}
+        active = self.bind_project_for(file_path)
+        full_p = self.resolve_path(file_path)
+        try:
+            outline = await asyncio.to_thread(_code_eye.outline, full_p)
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"❌ code_outline 실패: {e}"}], "isError": True}
+
+        # outline 은 FileOutline dataclass 객체
+        symbols = outline.symbols  # List[Symbol]
+        lang = outline.language
+        total = outline.total_lines
+        size = outline.total_bytes
+
+        lines = [
+            f"## 🔭 [코드 개요] `{file_path}`",
+            f"**🎯 활성 프로젝트**: `{active}`",
+            f"- 언어: `{lang}` | 총 줄: {total} | 크기: {size:,}B",
+            "",
+            "| # | 종류 | 심볼명 | 줄 범위 | 서명 |",
+            "|---|------|--------|---------|------|",
+        ]
+        for i, sym in enumerate(symbols, 1):
+            lines.append(
+                f"| {i} | `{sym.kind}` | `{sym.name}` "
+                f"| L{sym.line_start}–{sym.line_end} "
+                f"| {sym.signature[:60]} |"
+            )
+        lines.append(f"\n총 **{len(symbols)}개** 심볼. `deepseek_view_section` 으로 원하는 심볼 정밀 조회 가능.")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+    # ------------------------------------------------------------------
+    # 도구: 특정 심볼/줄 범위 정밀 조회 (code_tools.code_eye 위임)
+    # ------------------------------------------------------------------
+    async def _tool_view_section(self, file_path: str, symbol_name: str, line_range: str) -> Dict[str, Any]:
+        if not file_path:
+            return {"content": [{"type": "text", "text": "❌ file_path 인자가 비어 있습니다."}], "isError": True}
+        if not symbol_name and not line_range:
+            return {"content": [{"type": "text", "text": "❌ symbol_name 또는 line_range 중 하나는 반드시 지정해야 합니다."}], "isError": True}
+
+        active = self.bind_project_for(file_path)
+        full_p = self.resolve_path(file_path)
+
+        try:
+            if symbol_name:
+                # view_section 은 문자열을 반환함
+                text_result = await asyncio.to_thread(_code_eye.view_section, full_p, symbol_name)
+                label = symbol_name
+                location = ""
+            else:
+                # line_range "120-180" 파싱
+                parts = line_range.replace(":", "-").split("-")
+                if len(parts) != 2:
+                    return {"content": [{"type": "text", "text": f"❌ line_range 형식 오류: '{line_range}' (예: 120-180)"}], "isError": True}
+                start_l, end_l = int(parts[0].strip()), int(parts[1].strip())
+                text_result = await asyncio.to_thread(_code_eye.view_lines, full_p, start_l, end_l)
+                label = f"L{start_l}–{end_l}"
+                location = f" | 줄 범위: {label}"
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"❌ view_section 실패: {e}"}], "isError": True}
+
+        if text_result.startswith("❌"):
+            return {"content": [{"type": "text", "text": text_result}], "isError": True}
+
+        text = (
+            f"## 🔬 [정밀 조회] `{file_path}` → `{label}`\n"
+            f"**🎯 활성 프로젝트**: `{active}`{location}\n\n"
+            f"{text_result}"
+        )
         return {"content": [{"type": "text", "text": text}]}
 
     # ------------------------------------------------------------------

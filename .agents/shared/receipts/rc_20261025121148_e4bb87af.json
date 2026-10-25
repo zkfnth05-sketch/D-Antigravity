@@ -1,0 +1,47 @@
+{
+  "verdict": "PASS",
+  "tag": "council_debate",
+  "path": "C:\\Users\\zkfnt\\Desktop\\aider-main\\.agents\\scripts\\gatekeeper_hook.py",
+  "before": {
+    "exists": true,
+    "hash": "384e8d61dae96d119841cd4c3c92e5f94e8a903ff54e5d96201370df19684a7a",
+    "size": 32032
+  },
+  "after": {
+    "exists": true,
+    "hash": "4a9839bf8e4a9fc98109b73dbf64df1c41c73d9d6f36c45c68b0b1f49ae9b135",
+    "size": 36209
+  },
+  "requested_symbols": [
+    "Gatekeeper.classify"
+  ],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": true,
+      "detail": "36209B / 928줄"
+    },
+    {
+      "name": "content_changed",
+      "ok": true,
+      "detail": "변경됨 32032B -> 36209B"
+    },
+    {
+      "name": "syntax",
+      "ok": true,
+      "detail": "compile 통과"
+    },
+    {
+      "name": "no_truncation",
+      "ok": true,
+      "detail": "크기 비율 113%"
+    },
+    {
+      "name": "symbol:Gatekeeper.classify",
+      "ok": true,
+      "detail": "본문 변경 확인"
+    }
+  ],
+  "receipt_id": "rc_20261025121148_e4bb87af",
+  "created_at": "2026-10-25T12:11:48"
+}

@@ -4,7 +4,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python -c \"import os,sys,runpy; p=os.path.join('.agents','scripts','gatekeeper_hook.py'); sys.exit(0) if not os.path.exists(p) else runpy.run_path(p, run_name='__main__')\" --event PreInvocation",
+        "command": "python -c \"import os,sys,runpy; p='scripts/gatekeeper_hook.py' if os.path.exists('scripts/gatekeeper_hook.py') else '.agents/scripts/gatekeeper_hook.py'; runpy.run_path(p, run_name='__main__')\" --event PreInvocation",
         "timeout": 10
       }
     ],
@@ -14,7 +14,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -c \"import os,sys,runpy; p=os.path.join('.agents','scripts','gatekeeper_hook.py'); sys.exit(0) if not os.path.exists(p) else runpy.run_path(p, run_name='__main__')\" --event PreToolUse",
+            "command": "python -c \"import os,sys,runpy; p='scripts/gatekeeper_hook.py' if os.path.exists('scripts/gatekeeper_hook.py') else '.agents/scripts/gatekeeper_hook.py'; runpy.run_path(p, run_name='__main__')\" --event PreToolUse",
             "timeout": 10
           }
         ]

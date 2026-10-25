@@ -60,7 +60,7 @@ class CouncilDebateEngine:
             for enc in ["utf-8", "cp949", "euc-kr"]:
                 try:
                     with open(full_target_path, "r", encoding=enc) as f:
-                        real_file_content = f.read(90000)
+                        real_file_content = f.read()
                         break
                 except Exception:
                     continue
@@ -108,7 +108,7 @@ class CouncilDebateEngine:
                 "content": (
                     f"대상 파일: {filename}\n"
                     f"요구사항 및 고장 증상: {issue_description}\n"
-                    f"기존 소스코드 내용:\n```python\n{real_file_content[:50000] if real_file_content else '신규 파일'}\n```\n"
+                    f"기존 소스코드 내용:\n```python\n{real_file_content if real_file_content else '신규 파일'}\n```\n"
                     "근본 원인을 밝히고, 모듈화된 클린 설계 방향을 3줄 내외로 명확하게 브리핑하십시오."
                 )
             }
@@ -184,7 +184,7 @@ class CouncilDebateEngine:
                     "3. (무엇을 고쳤는지 세 번째 핵심)\n\n"
                     "### [실전 파이썬 코드]\n"
                     "```python\n"
-                    "# 100% 무인 작동하는 완성형 전체 코드\n"
+                    "# [100줄 이상 기존 파일은 전체 코드 금지 - SEARCH/REPLACE 블록만 출력] [100줄 미만 또는 신규 파일만] 100% 무인 작동하는 완성형 전체 코드\n"
                     "```"
                 )
             },
@@ -194,8 +194,8 @@ class CouncilDebateEngine:
                     f"아키텍트 원인분석: {r1_design[:2500]}\n"
                     f"감사관 피드백: {critic_feedback[:1500]}\n"
                     f"대상 파일: {filename}\n"
-                    f"기존 소스코드:\n```python\n{real_file_content[:50000] if real_file_content else ''}\n```\n"
-                    "3줄 브리핑과 함께 완성형 파이썬 코드를 작성하십시오."
+                    f"기존 소스코드:\n```python\n{real_file_content if real_file_content else ''}\n```\n"
+                    "3줄 브리핑과 함께, 100줄 이상 기존 파일이면 SEARCH/REPLACE 블록만, 100줄 미만이거나 신규 파일이면 완성형 파이썬 코드를 작성하십시오. SEARCH 구간은 원본에 실제로 존재하는 코드를 한 글자도 다르지 않게 복사해야 합니다."
                 )
             }
         ]
@@ -223,6 +223,12 @@ class CouncilDebateEngine:
         match = re.search(r"```python\s*([\s\S]*?)\s*```", full_eng_output)
         if match:
             extracted_code = match.group(1).strip()
+
+        # [SEARCH/REPLACE 패치 모드] 블록이 감지되면 전체 코드로 취급하지 않는다.
+        patch_text = ""
+        if "<<<<<<< SEARCH" in full_eng_output:
+            patch_text = full_eng_output
+            extracted_code = ""
 
         # -----------------------------------------------------------------
         # Phase 4: 🧪 QA (샌드박스 가상 검증관) - 실제 가상 컴파일러 검증
@@ -256,7 +262,7 @@ class CouncilDebateEngine:
                 qa_msg = f"❌ 컴파일 에러 감지:\n{syntax_res.get('error')}"
                 yield {"speaker": "🧪 QA: 샌드박스 가상 검증관", "role": "qa", "message": qa_msg}
         else:
-            yield {"speaker": "🧪 QA: 샌드박스 가상 검증관", "role": "qa", "message": "⚠️ 집필된 코드를 확인하여 에디터에 반영합니다."}
+            yield {"speaker": "🧪 QA: 샌드박스 가상 검증관", "role": "qa", "message": ("SEARCH/REPLACE 패치 모드: 적용 후 실제 파일에 대해 py_compile 검증을 수행합니다." if patch_text else "⚠️ 집필된 코드를 확인하여 에디터에 반영합니다.")}
 
         await asyncio.sleep(0.4)
 
@@ -280,6 +286,7 @@ class CouncilDebateEngine:
             "data": {
                 "path": target_file,
                 "diff": "".join(diff),
-                "new_content": extracted_code
+                "new_content": extracted_code,
+                "patch_text": patch_text
             }
         }

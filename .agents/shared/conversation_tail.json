@@ -1,0 +1,129 @@
+{
+ "conversation_id": "selftest",
+ "updated_at": "2026-10-25T10:55:57",
+ "transcript": "C:\\Users\\zkfnt\\AppData\\Local\\Temp\\bridge_selftest_qj6sim2m\\transcript.jsonl",
+ "bad_lines": 0,
+ "latest_user_request": "원문15",
+ "messages": [
+  {
+   "role": "user",
+   "step_index": 12,
+   "text": "원문6",
+   "chars_original": 3
+  },
+  {
+   "role": "assistant",
+   "step_index": 13,
+   "text": "응답6 본문입니다.",
+   "chars_original": 10
+  },
+  {
+   "role": "user",
+   "step_index": 14,
+   "text": "원문7",
+   "chars_original": 3
+  },
+  {
+   "role": "assistant",
+   "step_index": 15,
+   "text": "응답7 본문입니다.",
+   "chars_original": 10
+  },
+  {
+   "role": "user",
+   "step_index": 17,
+   "text": "원문8",
+   "chars_original": 3
+  },
+  {
+   "role": "assistant",
+   "step_index": 18,
+   "text": "응답8 본문입니다.",
+   "chars_original": 10
+  },
+  {
+   "role": "user",
+   "step_index": 19,
+   "text": "원문9",
+   "chars_original": 3
+  },
+  {
+   "role": "assistant",
+   "step_index": 20,
+   "text": "응답9 본문입니다.",
+   "chars_original": 10
+  },
+  {
+   "role": "user",
+   "step_index": 21,
+   "text": "원문10",
+   "chars_original": 4
+  },
+  {
+   "role": "assistant",
+   "step_index": 22,
+   "text": "응답10 본문입니다.",
+   "chars_original": 11
+  },
+  {
+   "role": "user",
+   "step_index": 23,
+   "text": "원문11",
+   "chars_original": 4
+  },
+  {
+   "role": "assistant",
+   "step_index": 25,
+   "text": "응답11 본문입니다.",
+   "chars_original": 11
+  },
+  {
+   "role": "user",
+   "step_index": 26,
+   "text": "원문12",
+   "chars_original": 4
+  },
+  {
+   "role": "assistant",
+   "step_index": 27,
+   "text": "응답12 본문입니다.",
+   "chars_original": 11
+  },
+  {
+   "role": "user",
+   "step_index": 28,
+   "text": "원문13",
+   "chars_original": 4
+  },
+  {
+   "role": "assistant",
+   "step_index": 29,
+   "text": "응답13 본문입니다.",
+   "chars_original": 11
+  },
+  {
+   "role": "user",
+   "step_index": 30,
+   "text": "원문14",
+   "chars_original": 4
+  },
+  {
+   "role": "assistant",
+   "step_index": 31,
+   "text": "응답14 본문입니다.",
+   "chars_original": 11
+  },
+  {
+   "role": "user",
+   "step_index": 33,
+   "text": "원문15",
+   "chars_original": 4
+  },
+  {
+   "role": "assistant",
+   "step_index": 34,
+   "text": "응답15 본문입니다.",
+   "chars_original": 11
+  }
+ ]
+}

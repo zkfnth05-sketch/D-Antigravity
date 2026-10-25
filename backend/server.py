@@ -122,7 +122,7 @@ def safe_resolve(path: str) -> str:
         return os.path.abspath(os.path.join(pm.active_project, path))
 
 
-def read_text_safe(full_path: str, limit: int = 100000):
+def read_text_safe(full_path: str, limit=None):
     """인코딩 자동 감지 파일 읽기. (content, encoding) 반환."""
     content = ""
     encoding_used = "utf-8"

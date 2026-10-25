@@ -1,0 +1,14 @@
+{
+  "verdict": "UNVERIFIED",
+  "tag": "autonomous_codegen",
+  "path": "",
+  "checks": [
+    {
+      "name": "target",
+      "ok": false,
+      "detail": "대상 파일 경로 미지정 — 검증 불가"
+    }
+  ],
+  "receipt_id": "rc_20261025122619_22011321",
+  "created_at": "2026-10-25T12:26:19"
+}

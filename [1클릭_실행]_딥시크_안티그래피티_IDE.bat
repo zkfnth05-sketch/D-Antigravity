@@ -102,11 +102,17 @@ if defined READY (
     echo [경고] %WAITED%회 폴링 내 응답 없음. 그래도 브라우저를 엽니다.
 )
 
-REM ---------- [7] 2초 대기 후 브라우저 자동 오픈 ----------
-echo [5/5] 2초 후 기본 브라우저로 IDE 를 엽니다 ...
-ping -n 3 127.0.0.1 >nul 2>&1
-start "" "%FRONTEND%"
-echo        브라우저 실행 : %FRONTEND%
+REM ---------- [7] 2초 대기 후 Antigravity IDE 워크스페이스 실행 ----------
+echo [5/5] Antigravity IDE 를 엽니다 ...
+ping -n 2 127.0.0.1 >nul 2>&1
+set "IDE_EXE=%LOCALAPPDATA%\Programs\DeepSeek Antigravity IDE\Antigravity IDE.exe"
+set "WORKSPACE=%ROOT%\DeepSeek_Antigravity.code-workspace"
+if exist "%IDE_EXE%" (
+    start "" "%IDE_EXE%" "%WORKSPACE%"
+    echo        IDE 실행 : %WORKSPACE%
+) else (
+    echo        [경고] IDE 실행 파일을 찾을 수 없습니다: %IDE_EXE%
+)
 
 REM ---------- [8] 5인 협업체 가동 상태 안내 ----------
 echo.

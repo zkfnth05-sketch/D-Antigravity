@@ -723,6 +723,19 @@ class ProjectManager:
                         original_content = f.read()
                 except Exception:
                     original_content = ""
+            # [WRITE-GUARD] 대용량 원본을 과도하게 축소하는 덮어쓰기를 물리적으로 차단
+            from core.write_guard import check_overwrite
+            _guard_ok, _guard_reason = check_overwrite(original_content, new_content)
+            if not _guard_ok:
+                logger.error("[ProjectManager] %s | 대상: %s", _guard_reason, target)
+                return {
+                    "success": False,
+                    "error": _guard_reason,
+                    "path": target,
+                    "diff": "",
+                    "backup_path": "",
+                    "stats": {"added": 0, "removed": 0},
+                }
             backup_path = self._create_backup(target, original_content) or ""
 
             # [SNAPSHOT-ENGINE] 시간별 스냅샷 생성 + timeline.jsonl 원장 기록

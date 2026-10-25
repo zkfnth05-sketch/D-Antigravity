@@ -1,0 +1,35 @@
+{
+  "verdict": "PASS",
+  "tag": "council_debate",
+  "path": "C:\\Users\\zkfnt\\Desktop\\DeepSeek_Antigravity_IDE\\brands\\aura\\aura_drama_pipeline.py",
+  "before": {
+    "exists": false,
+    "hash": "",
+    "size": 0
+  },
+  "after": {
+    "exists": true,
+    "hash": "2fb4d3989aa5c0a31b72eab6f52e4121aed18ba3894a5c7ad9d9bb2aeaa04e8b",
+    "size": 10115
+  },
+  "requested_symbols": [],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": true,
+      "detail": "10115B / 267줄"
+    },
+    {
+      "name": "content_changed",
+      "ok": true,
+      "detail": "신규 파일 생성"
+    },
+    {
+      "name": "syntax",
+      "ok": true,
+      "detail": "compile 통과"
+    }
+  ],
+  "receipt_id": "rc_20261025125240_f6a99c74",
+  "created_at": "2026-10-25T12:52:40"
+}
