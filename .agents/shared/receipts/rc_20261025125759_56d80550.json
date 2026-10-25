@@ -1,0 +1,25 @@
+{
+  "verdict": "FAIL",
+  "tag": "autonomous_codegen",
+  "path": "C:\\Users\\zkfnt\\Desktop\\한국 마케팅봇\\kmarket-marketing-engine\\brands\\aura\\aura_drama_5scenes_producer.py",
+  "before": {
+    "exists": false,
+    "hash": "",
+    "size": 0
+  },
+  "after": {
+    "exists": false,
+    "hash": "",
+    "size": 0
+  },
+  "requested_symbols": [],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": false,
+      "detail": "수정 후 파일이 디스크에 없음"
+    }
+  ],
+  "receipt_id": "rc_20261025125759_56d80550",
+  "created_at": "2026-10-25T12:57:59"
+}

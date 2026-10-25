@@ -1,0 +1,25 @@
+{
+  "verdict": "FAIL",
+  "tag": "council_debate",
+  "path": "C:\\Users\\zkfnt\\Desktop\\DeepSeek_Antigravity_IDE\\kmarket-marketing-engine\\brands\\aura\\aura_drama_5scenes_pipeline.py",
+  "before": {
+    "exists": false,
+    "hash": "",
+    "size": 0
+  },
+  "after": {
+    "exists": false,
+    "hash": "",
+    "size": 0
+  },
+  "requested_symbols": [],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": false,
+      "detail": "수정 후 파일이 디스크에 없음"
+    }
+  ],
+  "receipt_id": "rc_20261025125837_5b6b85bd",
+  "created_at": "2026-10-25T12:58:37"
+}

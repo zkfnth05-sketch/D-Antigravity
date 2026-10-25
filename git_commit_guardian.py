@@ -335,9 +335,21 @@ def commit_repo(
 def push_repo(repo: Path, label: str) -> bool:
     section(f"{label} : 원격 푸시")
     upstream = git_out(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+
     if not upstream:
-        warn("업스트림 브랜치가 설정되지 않아 푸시를 건너뜁니다.")
-        return False
+        # 최초 푸시 또는 미추적 브랜치: 현재 브랜치를 origin 에 업스트림으로 등록하며 푸시
+        branch = git_out(repo, ["rev-parse", "--abbrev-ref", "HEAD"]) or "main"
+        if branch == "HEAD":
+            warn("detached HEAD 상태여서 푸시를 건너뜁니다.")
+            return False
+        info(f"업스트림 미설정 -> push -u origin {branch} 로 자동 등록 후 푸시")
+        proc = run_git(repo, ["push", "-u", "origin", branch])
+        if proc.returncode != 0:
+            fail(f"푸시 실패: {((proc.stderr or '') + (proc.stdout or '')).strip()[:400]}")
+            return False
+        ok(f"푸시 완료 -> origin/{branch} (업스트림 신규 등록)")
+        return True
+
     proc = run_git(repo, ["push"])
     if proc.returncode != 0:
         fail(f"푸시 실패: {((proc.stderr or '') + (proc.stdout or '')).strip()[:400]}")

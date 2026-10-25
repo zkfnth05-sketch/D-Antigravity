@@ -1,0 +1,40 @@
+{
+  "verdict": "PASS",
+  "tag": "autonomous_codegen",
+  "path": "C:\\Users\\zkfnt\\Desktop\\DeepSeek_Antigravity_IDE\\git_commit_guardian.py",
+  "before": {
+    "exists": true,
+    "hash": "f0d2e06fbf2f8260bdf5a540aed506812de185ecbf1434bbe1e708e86a7daeff",
+    "size": 15825
+  },
+  "after": {
+    "exists": true,
+    "hash": "24d26a5717f0bc2d30f9af34aee45a6e20bd68534fb3f3326fe35bf379ba6072",
+    "size": 16457
+  },
+  "requested_symbols": [],
+  "checks": [
+    {
+      "name": "file_exists",
+      "ok": true,
+      "detail": "16457B / 472줄"
+    },
+    {
+      "name": "content_changed",
+      "ok": true,
+      "detail": "변경됨 15825B -> 16457B"
+    },
+    {
+      "name": "syntax",
+      "ok": true,
+      "detail": "compile 통과"
+    },
+    {
+      "name": "no_truncation",
+      "ok": true,
+      "detail": "크기 비율 104%"
+    }
+  ],
+  "receipt_id": "rc_20261025125812_30ec6b6e",
+  "created_at": "2026-10-25T12:58:12"
+}
